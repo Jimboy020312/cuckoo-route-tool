@@ -1,0 +1,4 @@
+venv/
+cuckoo_export.csv
+__pycache__/
+*.pyc
