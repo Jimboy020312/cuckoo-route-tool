@@ -84,6 +84,10 @@ LABEL_FIELD_MAP = {
     "Cust Name": "cust_name",
 }
 KEY_FIELD = "ns_no"   # unique per card — avoids re-scraping someone after scrolling
+# a card missing any of these is
+REQUIRED_LIST_FIELDS = set(LABEL_FIELD_MAP.values())
+# probably cut off by the screen
+# edge, not actually incomplete data
 
 # --- Detail screen: Address/Contact Info tab (confirmed from XML) ---
 BILLING_LABEL_MAP = {
@@ -162,7 +166,7 @@ def build_driver():
 
 def wait_for(driver, selector, timeout=WAIT_SECONDS):
     by, value = selector
-    return xWebDriverWait(driver, timeout).until(
+    return WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((by, value))
     )
 
@@ -236,28 +240,23 @@ def scroll_down(driver, percent=None):
     dismiss_keyboard_if_present(driver)
 
 
-def compute_scroll_percent(driver, customers, margin_fraction=0.04):
+def compute_scroll_percent(driver, target_top_y, margin_fraction=0.04):
     """
-    Measures exactly where the LAST customer currently on screen sits
-    (customers are already top-to-bottom order), and computes the exact
-    scroll fraction needed to bring that card's top boundary up near
-    the top of the scroll region — i.e. "scroll to the line separating
-    this card from the next," rather than a blind fixed distance.
+    Computes the exact scroll fraction needed to bring `target_top_y`
+    (a real, measured card position) up near the top of the scroll
+    region — "scroll to the line separating this card from the next,"
+    rather than a blind fixed distance.
 
-    A small margin is subtracted so the boundary lands just inside the
+    A small margin is subtracted so the target lands just inside the
     visible region instead of exactly on the edge, avoiding the
-    partially-rendered-row problem from earlier.
+    partially-rendered-row problem.
     """
-    if not customers:
-        return SCROLL_STEP_PERCENT
-
     size = driver.get_window_size()
     height = size["height"]
     region_top = height * SCROLL_REGION_TOP_FRACTION
     region_height = height * SCROLL_REGION_HEIGHT_FRACTION
 
-    last_card_top_y = customers[-1]["card_top_y"]
-    desired_shift = (last_card_top_y - region_top) - \
+    desired_shift = (target_top_y - region_top) - \
         (margin_fraction * region_height)
     percent = desired_shift / region_height
 
@@ -445,8 +444,17 @@ def get_visible_customers(driver):
 
         matching_button = next(
             (b_el for b_y, b_el in button_positions if card_top_y <= b_y < next_top_y), None)
-        customers.append(
-            {"row": parsed_row, "button": matching_button, "card_top_y": card_top_y})
+        # A card missing any expected field (most commonly Cust Name,
+        # since it's the LAST field on the card) usually means it's only
+        # partially scrolled into view — its bottom hasn't fully rendered
+        # yet, not that the data is genuinely blank.
+        complete = len(field_dict) == len(LABEL_FIELD_MAP)
+        customers.append({
+            "row": parsed_row,
+            "button": matching_button,
+            "card_top_y": card_top_y,
+            "complete": complete,
+        })
 
     if DEBUG:
         for c in customers:
@@ -600,20 +608,44 @@ def run():
             customers = get_visible_customers_stable(driver)
 
             next_customer = None
+            partial_customer = None
             for c in customers:
                 key = c["row"].get(KEY_FIELD)
                 if not key or key in seen_keys:
                     continue
-                if c["button"] is None:
-                    # Card is likely only partially scrolled into view (its
-                    # NS No label rendered, but the button below it hasn't
-                    # yet). Don't mark it seen — leave it to be retried once
-                    # it's fully visible, instead of losing it permanently.
+                if c["button"] is None or not c.get("complete", True):
+                    # Card is likely only partially scrolled into view — its
+                    # NS No rendered (enough to be found and keyed), but its
+                    # button and/or its later fields (Cust Name is the last
+                    # field on the card, so it's usually the first casualty)
+                    # haven't fully rendered yet. Don't mark it seen; remember
+                    # it so we can scroll IT specifically into full view,
+                    # rather than treating this like "nothing new at all."
+                    if partial_customer is None:
+                        partial_customer = c
                     continue
                 next_customer = c
                 break
 
             if next_customer is None:
+                if partial_customer is not None:
+                    # There IS a new customer here — it's just not fully
+                    # rendered yet. Scroll targeted at THIS card's own
+                    # position (not the generic "last customer" case below)
+                    # so it comes fully into view instead of being skipped.
+                    scroll_count += 1
+                    if scroll_count >= MAX_SCROLLS:
+                        print(
+                            "Hit the safety scroll limit — stopping to avoid an infinite loop.")
+                        break
+                    target_percent = compute_scroll_percent(
+                        driver, partial_customer["card_top_y"])
+                    if DEBUG:
+                        print(f"  [debug] {partial_customer['row'].get(KEY_FIELD)} not fully rendered yet — "
+                              f"scrolling it into view (percent={target_percent:.3f})")
+                    scroll_down(driver, percent=target_percent)
+                    continue
+
                 stagnant_rounds += 1
                 if stagnant_rounds >= MAX_STAGNANT_ROUNDS:
                     print(
@@ -624,7 +656,8 @@ def run():
                     print(
                         "Hit the safety scroll limit — stopping to avoid an infinite loop.")
                     break
-                target_percent = compute_scroll_percent(driver, customers)
+                target_percent = compute_scroll_percent(
+                    driver, customers[-1]["card_top_y"]) if customers else SCROLL_STEP_PERCENT
                 if DEBUG:
                     print(
                         f"  [debug] scrolling by measured percent={target_percent:.3f}")
