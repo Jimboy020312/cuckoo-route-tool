@@ -69,8 +69,9 @@ APP_PACKAGE = "cuckoo.doctress"
 # confirmed: the list screen
 APP_ACTIVITY = "cuckoo.doctress.naturalcareservicelist"
 
-LIST_LIMIT = 3   # start small; set to None to process the whole list once trusted
-DEBUG = True      # prints diagnostic info about what's found on the list screen — turn off once things work
+LIST_LIMIT = None   # was 3 for testing — now processes the whole list
+# set True again only if something breaks and you need to see raw element data
+DEBUG = False
 
 # --- List screen (confirmed from XML) ---
 LABEL_FIELD_MAP = {
@@ -137,8 +138,13 @@ SALES_INFO_LABEL_MAP = {
 
 OUTPUT_CSV = "cuckoo_export.csv"
 WAIT_SECONDS = 10
-MAX_SCROLLS = 80
+# raised since smaller, controlled scroll steps need more of them to reach the bottom
+MAX_SCROLLS = 300
 MAX_STAGNANT_ROUNDS = 2
+# fallback step, only used when there's no measured position to target yet (e.g. the very first scroll)
+SCROLL_STEP_PERCENT = 0.32
+SCROLL_REGION_TOP_FRACTION = 0.40     # stays below the pinned filter header
+SCROLL_REGION_HEIGHT_FRACTION = 0.48
 
 
 # ============================================================
@@ -156,7 +162,7 @@ def build_driver():
 
 def wait_for(driver, selector, timeout=WAIT_SECONDS):
     by, value = selector
-    return WebDriverWait(driver, timeout).until(
+    return xWebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((by, value))
     )
 
@@ -194,18 +200,80 @@ def tap_element(driver, element):
     driver.execute_script("mobile: clickGesture", {"x": cx, "y": cy})
 
 
-def scroll_down(driver):
+def scroll_down(driver, percent=None):
+    """
+    Uses "mobile: scrollGesture" rather than "mobile: swipeGesture" —
+    swipeGesture performs a FLING, which has momentum: Android keeps
+    scrolling after the simulated finger lifts, and how far it travels
+    depends on gesture velocity in a way that's hard to predict. That
+    inconsistency was very likely why scrolling sometimes jumped past
+    several customers at once. scrollGesture instead moves a fixed,
+    controlled fraction of the given area with no fling.
+
+    `percent`, when given, comes from compute_scroll_percent() — a
+    measured amount based on exactly where the last already-processed
+    customer's card sits on screen right now, rather than a guessed
+    fixed distance. Falls back to SCROLL_STEP_PERCENT only when there's
+    no measurement to base it on yet (the very first scroll).
+
+    Note: for scrollGesture, "direction" describes which way the
+    CONTENT moves (not the simulated finger) — "down" reveals further/
+    later items in the list, which is what swipeGesture called "up".
+    """
+    if percent is None:
+        percent = SCROLL_STEP_PERCENT
     size = driver.get_window_size()
     width, height = size["width"], size["height"]
-    driver.execute_script("mobile: swipeGesture", {
+    driver.execute_script("mobile: scrollGesture", {
         "left": int(width * 0.1),
-        "top": int(height * 0.2),
+        "top": int(height * SCROLL_REGION_TOP_FRACTION),
         "width": int(width * 0.8),
-        "height": int(height * 0.6),
-        "direction": "up",
-        "percent": 0.8,
+        "height": int(height * SCROLL_REGION_HEIGHT_FRACTION),
+        "direction": "down",
+        "percent": percent,
     })
-    time.sleep(1)
+    time.sleep(0.6)
+    dismiss_keyboard_if_present(driver)
+
+
+def compute_scroll_percent(driver, customers, margin_fraction=0.04):
+    """
+    Measures exactly where the LAST customer currently on screen sits
+    (customers are already top-to-bottom order), and computes the exact
+    scroll fraction needed to bring that card's top boundary up near
+    the top of the scroll region — i.e. "scroll to the line separating
+    this card from the next," rather than a blind fixed distance.
+
+    A small margin is subtracted so the boundary lands just inside the
+    visible region instead of exactly on the edge, avoiding the
+    partially-rendered-row problem from earlier.
+    """
+    if not customers:
+        return SCROLL_STEP_PERCENT
+
+    size = driver.get_window_size()
+    height = size["height"]
+    region_top = height * SCROLL_REGION_TOP_FRACTION
+    region_height = height * SCROLL_REGION_HEIGHT_FRACTION
+
+    last_card_top_y = customers[-1]["card_top_y"]
+    desired_shift = (last_card_top_y - region_top) - \
+        (margin_fraction * region_height)
+    percent = desired_shift / region_height
+
+    # Guardrails: never scroll by ~nothing (no progress) or overshoot
+    # past the measured area (which would defeat the point of measuring).
+    return max(0.08, min(0.95, percent))
+
+
+def dismiss_keyboard_if_present(driver):
+    """Defensive safety net — closes the keyboard if anything ever
+    accidentally focuses a text field again, so it doesn't silently
+    corrupt the next read."""
+    try:
+        driver.execute_script("mobile: hideKeyboard")
+    except Exception:
+        pass  # no keyboard was showing, or the command isn't supported — fine either way
 
 
 def pair_fields(elements, known_labels=None, skip_texts=None, y_tol=8):
@@ -377,13 +445,37 @@ def get_visible_customers(driver):
 
         matching_button = next(
             (b_el for b_y, b_el in button_positions if card_top_y <= b_y < next_top_y), None)
-        customers.append({"row": parsed_row, "button": matching_button})
+        customers.append(
+            {"row": parsed_row, "button": matching_button, "card_top_y": card_top_y})
 
     if DEBUG:
         for c in customers:
             print(
                 f"  [debug] parsed customer: {c['row']}  (button found: {c['button'] is not None})")
 
+    return customers
+
+
+def get_visible_customers_stable(driver, max_attempts=4, settle_delay=0.4):
+    """
+    Reads the screen repeatedly until two consecutive reads agree on
+    which NS numbers are visible. A single read can catch the view
+    mid-render — Android list rows get REUSED as you scroll, so reading
+    too early can show a row still holding the PREVIOUS customer's name
+    while its NS No has already updated to the new one. That's what was
+    causing blank names and, worse, a name attached to the wrong NS
+    number. Waiting for two matching reads in a row avoids trusting a
+    transitional, half-updated state.
+    """
+    prev_signature = None
+    customers = []
+    for _ in range(max_attempts):
+        customers = get_visible_customers(driver)
+        signature = tuple(c["row"].get(KEY_FIELD, "") for c in customers)
+        if signature == prev_signature and signature:
+            return customers
+        prev_signature = signature
+        time.sleep(settle_delay)
     return customers
 
 
@@ -473,7 +565,8 @@ def read_full_detail(driver):
     sales_tab = wait_for(
         driver, (AppiumBy.XPATH, '//android.widget.TextView[@text="Sales Info"]'))
     tap_element(driver, sales_tab)
-    time.sleep(1)
+    # get_sales_info_elements() below already waits/polls for "Current Stage"
+    # to appear, so no fixed sleep needed here.
 
     sales_row, _ = pair_fields(
         get_sales_info_elements(driver),
@@ -504,14 +597,21 @@ def run():
                 print(f"Reached LIST_LIMIT of {LIST_LIMIT} — stopping.")
                 break
 
-            customers = get_visible_customers(driver)
+            customers = get_visible_customers_stable(driver)
 
             next_customer = None
             for c in customers:
                 key = c["row"].get(KEY_FIELD)
-                if key and key not in seen_keys:
-                    next_customer = c
-                    break
+                if not key or key in seen_keys:
+                    continue
+                if c["button"] is None:
+                    # Card is likely only partially scrolled into view (its
+                    # NS No label rendered, but the button below it hasn't
+                    # yet). Don't mark it seen — leave it to be retried once
+                    # it's fully visible, instead of losing it permanently.
+                    continue
+                next_customer = c
+                break
 
             if next_customer is None:
                 stagnant_rounds += 1
@@ -524,7 +624,11 @@ def run():
                     print(
                         "Hit the safety scroll limit — stopping to avoid an infinite loop.")
                     break
-                scroll_down(driver)
+                target_percent = compute_scroll_percent(driver, customers)
+                if DEBUG:
+                    print(
+                        f"  [debug] scrolling by measured percent={target_percent:.3f}")
+                scroll_down(driver, percent=target_percent)
                 continue
 
             stagnant_rounds = 0
@@ -539,21 +643,41 @@ def run():
                 if button is None:
                     raise RuntimeError(
                         "No 'View Order' button found near this customer's row")
-                tap_element(driver, button)
-                time.sleep(1)
 
-                select_popup_option(driver, "View Order")
-                time.sleep(1.5)
-                wait_for(driver, (AppiumBy.XPATH,
-                         '//android.widget.Button[@text="Customer Information"]'))
+                try:
+                    tap_element(driver, button)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[stage: tapping row button] {type(e).__name__}: {e}")
 
-                detail = read_full_detail(driver)
+                try:
+                    # select_popup_option() already waits/polls for the popup
+                    # to appear — no fixed sleep needed before it.
+                    select_popup_option(driver, "View Order")
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[stage: selecting 'View Order' from popup] {type(e).__name__}: {e}")
+
+                try:
+                    wait_for(
+                        driver, (AppiumBy.XPATH, '//android.widget.Button[@text="Customer Information"]'))
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[stage: waiting for Customer Information screen] {type(e).__name__}: {e}")
+
+                try:
+                    detail = read_full_detail(driver)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"[stage: reading detail screen fields] {type(e).__name__}: {e}")
+
                 all_records.append({**next_row, **detail})
             except Exception as e:
                 print(f"  !! Skipped {key} due to error: {e}")
             finally:
                 driver.back()
-                time.sleep(1)
+                # get_visible_customers() at the top of the next loop already
+                # waits/polls for "NS No" to reappear, so no sleep needed here.
 
     finally:
         driver.quit()
@@ -567,10 +691,22 @@ def write_csv(records):
         print("No records captured — nothing written.")
         return
     fieldnames = sorted({key for r in records for key in r.keys()})
+
+    # Excel treats any CSV cell starting with +, -, or = as the start of a
+    # formula (e.g. "+60-127156860" gets evaluated as 60 minus 127156860).
+    # A leading apostrophe tells Excel "this is literal text" and is not
+    # shown in the cell — this keeps phone numbers displaying correctly.
+    def excel_safe(value):
+        if isinstance(value, str) and value[:1] in ("+", "-", "="):
+            return "'" + value
+        return value
+
+    safe_records = [{k: excel_safe(v) for k, v in r.items()} for r in records]
+
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(records)
+        writer.writerows(safe_records)
 
 
 if __name__ == "__main__":
