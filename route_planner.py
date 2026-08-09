@@ -125,7 +125,8 @@ def _nominatim_query(params):
     """One rate-limited request to Nominatim. Returns the raw first
     result dict (with lat/lon/boundingbox/etc.) or None."""
     url = NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": NOMINATIM_USER_AGENT})
+    req = urllib.request.Request(
+        url, headers={"User-Agent": NOMINATIM_USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             results = json.loads(resp.read().decode("utf-8"))
@@ -245,7 +246,8 @@ def geocode_address(address, cache):
 
     coords = (float(result["lat"]), float(result["lon"])) if result else None
     if result:
-        print(f"    [geocode] \"{key[:40]}...\" -> matched \"{result.get('display_name', '?')}\"")
+        print(
+            f"    [geocode] \"{key[:40]}...\" -> matched \"{result.get('display_name', '?')}\"")
     cache[key] = list(coords) if coords else None
     save_geocode_cache(cache)
     return coords
@@ -261,7 +263,8 @@ def haversine_km(lat1, lon1, lat2, lon2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * \
+        math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
 
@@ -318,11 +321,45 @@ def gmaps_single_link(lat, lon):
 # Visual map (Leaflet + OpenStreetMap tiles, no API key)
 # ============================================================
 
+def _jitter_overlapping_markers(markers, radius_meters=15):
+    """
+    Fans out markers that share the exact same coordinates — very
+    common once addresses are simplified to street/precinct level,
+    since several customers in the same precinct will genuinely
+    resolve to one identical point — into a small circle around that
+    point, purely so they're visually distinguishable as separate pins
+    instead of one indistinguishable stacked dot.
+
+    COSMETIC ONLY: doesn't touch grouping (that already happened, using
+    the real coordinates), doesn't change any stored/cached coordinate,
+    and the offset is tiny (15m default) relative to CLUSTER_RADIUS_KM's
+    kilometer scale — nowhere near enough to move a marker into a
+    different area or mislead about which precinct it's actually in.
+    """
+    groups = {}
+    for m in markers:
+        key = (round(m["lat"], 6), round(m["lon"], 6))
+        groups.setdefault(key, []).append(m)
+
+    for (lat, lon), group in groups.items():
+        n = len(group)
+        if n <= 1:
+            continue
+        lat_deg_per_m = 1 / 111320
+        lon_deg_per_m = 1 / (111320 * math.cos(math.radians(lat)) or 1)
+        for i, m in enumerate(group):
+            angle = 2 * math.pi * i / n
+            m["lat"] = lat + radius_meters * math.sin(angle) * lat_deg_per_m
+            m["lon"] = lon + radius_meters * math.cos(angle) * lon_deg_per_m
+
+
 def write_map_html(geocoded, path=MAP_HTML_FILE):
     """
     Writes a single self-contained HTML file with every geocoded
     address plotted as a colored, labeled marker (color = area, so
-    areas are visually obvious at a glance).
+    areas are visually obvious at a glance). Markers sharing identical
+    coordinates get a small cosmetic offset so they're visible as
+    separate pins — see _jitter_overlapping_markers().
 
     Leaflet's JS/CSS are embedded INLINE (read from leaflet.js and
     leaflet.css, which need to sit in the same folder as this script)
@@ -359,6 +396,7 @@ def write_map_html(geocoded, path=MAP_HTML_FILE):
             "color": AREA_COLORS[r["area"] % len(AREA_COLORS)],
             "area": r["area"] + 1,
         })
+    _jitter_overlapping_markers(markers)
 
     if markers:
         center_lat = sum(m["lat"] for m in markers) / len(markers)
@@ -504,7 +542,8 @@ def run():
         ws.cell(row=r["row_idx"], column=11,
                 value=f"Area {r['area'] + 1}").font = Font(name=FONT, size=10)
     for r in failed:
-        ws.cell(row=r["row_idx"], column=11, value="?").font = Font(name=FONT, size=10)
+        ws.cell(row=r["row_idx"], column=11,
+                value="?").font = Font(name=FONT, size=10)
 
     ws.column_dimensions["K"].width = 10
 
@@ -523,7 +562,8 @@ def run():
                        value=f"Area {area + 1} — {len(area_rows)} address(es)")
         cell.font = Font(name=FONT, size=12, bold=True, color="FFFFFF")
         cell.fill = area_fill
-        rp.merge_cells(start_row=r_idx, start_column=1, end_row=r_idx, end_column=4)
+        rp.merge_cells(start_row=r_idx, start_column=1,
+                       end_row=r_idx, end_column=4)
         r_idx += 1
 
         headers = ["Sales No", "Contact", "Phone", "Address (tap to open)"]
@@ -534,27 +574,36 @@ def run():
         r_idx += 1
 
         for r in area_rows:
-            rp.cell(row=r_idx, column=1, value=r["sales_no"]).font = Font(name=FONT, size=10)
-            rp.cell(row=r_idx, column=2, value=r["contact"]).font = Font(name=FONT, size=10)
-            rp.cell(row=r_idx, column=3, value=r["phone"]).font = Font(name=FONT, size=10)
+            rp.cell(row=r_idx, column=1, value=r["sales_no"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=r_idx, column=2, value=r["contact"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=r_idx, column=3, value=r["phone"]).font = Font(
+                name=FONT, size=10)
             addr_cell = rp.cell(row=r_idx, column=4, value=r["address"])
             addr_cell.hyperlink = gmaps_single_link(r["lat"], r["lon"])
-            addr_cell.font = Font(name=FONT, size=10, color="1155CC", underline="single")
+            addr_cell.font = Font(name=FONT, size=10,
+                                  color="1155CC", underline="single")
             addr_cell.alignment = Alignment(wrap_text=True)
             r_idx += 1
 
         r_idx += 1  # blank row between areas
 
     if failed:
-        cell = rp.cell(row=r_idx, column=1, value="Could not place automatically — assign manually")
+        cell = rp.cell(row=r_idx, column=1,
+                       value="Could not place automatically — assign manually")
         cell.font = Font(name=FONT, size=12, bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="C00000")
-        rp.merge_cells(start_row=r_idx, start_column=1, end_row=r_idx, end_column=4)
+        rp.merge_cells(start_row=r_idx, start_column=1,
+                       end_row=r_idx, end_column=4)
         r_idx += 1
         for r in failed:
-            rp.cell(row=r_idx, column=1, value=r["sales_no"]).font = Font(name=FONT, size=10)
-            rp.cell(row=r_idx, column=2, value=r["contact"]).font = Font(name=FONT, size=10)
-            rp.cell(row=r_idx, column=3, value=r["phone"]).font = Font(name=FONT, size=10)
+            rp.cell(row=r_idx, column=1, value=r["sales_no"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=r_idx, column=2, value=r["contact"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=r_idx, column=3, value=r["phone"]).font = Font(
+                name=FONT, size=10)
             addr_cell = rp.cell(row=r_idx, column=4, value=r["address"])
             addr_cell.alignment = Alignment(wrap_text=True)
             addr_cell.font = Font(name=FONT, size=10)
