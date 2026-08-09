@@ -46,13 +46,30 @@ is a different, separate product-name value from that section of the
 app — both are genuine product names from different parts of the
 record, not a mislabeled dealer code.
 
-Start with LIST_LIMIT = 3. Once the CSV looks right, set it to None to
-process the entire list.
+OUTPUT NOTE
+--------------------------
+Everything above and everything in the scraping/scrolling code below
+is UNCHANGED — only the final export step is different. The exported
+file only includes the 6 fields actually needed (sales_no, appt_date,
+sales_info_product, install_contact_person, install_mobile1,
+install_address), in that order, plus proposed_date (typed by hand),
+a WhatsApp Message column (auto-fills once a date is typed, formatted
+to match the WhatsApp bold style: *Hanis*, *Tarikh:*, *Alamat:*,
+*Produk:*, *Nombor Pesanan:*), and a WhatsApp Link column — a tap-to-
+send wa.me link with that message already filled in via URL, so
+there's nothing to copy/paste by hand. This has to be .xlsx rather
+than .csv, since a plain CSV can't hold a live formula.
+
+Start with LIST_LIMIT = 3. Once the export looks right, set it to
+None to process the entire list.
 """
 
-import csv
+import os
 import re
 import time
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.comments import Comment
 from appium import webdriver
 from appium.options.android import UiAutomator2Options
 from appium.webdriver.common.appiumby import AppiumBy
@@ -69,7 +86,7 @@ APP_PACKAGE = "cuckoo.doctress"
 # confirmed: the list screen
 APP_ACTIVITY = "cuckoo.doctress.naturalcareservicelist"
 
-LIST_LIMIT = None   # was 3 for testing — now processes the whole list
+LIST_LIMIT = 4   # was 3 for testing — now processes the whole list
 # set True again only if something breaks and you need to see raw element data
 DEBUG = False
 
@@ -140,7 +157,16 @@ SALES_INFO_LABEL_MAP = {
     "Rental Scheme": "rental_scheme",
 }
 
-OUTPUT_CSV = "cuckoo_export.csv"
+OUTPUT_FILE = "cuckoo_export.xlsx"
+# Optional: if this .xlsm exists (created once, manually — see the
+# write_output()/wa_link_formula() docstrings below for the one-time
+# setup), the export writes INTO it instead, preserving its macro so
+# the WhatsApp Link column can double-click-open a chat with the full
+# message pre-filled, sidestepping HYPERLINK()'s 255-char limit. If it
+# doesn't exist, everything still works — the export just falls back
+# to the plain .xlsx with a click-to-open-chat-then-paste link instead.
+TEMPLATE_FILE = "cuckoo_export_template.xlsm"
+OUTPUT_FILE_XLSM = "cuckoo_export.xlsm"
 WAIT_SECONDS = 10
 # raised since smaller, controlled scroll steps need more of them to reach the bottom
 MAX_SCROLLS = 300
@@ -715,31 +741,267 @@ def run():
     finally:
         driver.quit()
 
-    write_csv(all_records)
-    print(f"Done. Wrote {len(all_records)} records to {OUTPUT_CSV}")
+    written_to = write_output(all_records)
+    print(f"Done. Wrote {len(all_records)} records to {written_to}")
 
 
-def write_csv(records):
+# ============================================================
+# Export: only the 6 requested fields, in this exact order, plus
+# proposed_date (typed by hand) and the two self-filling WhatsApp
+# columns.
+# ============================================================
+
+DATA_COLUMNS = [
+    "sales_no",
+    "appt_date",
+    "sales_info_product",
+    "install_contact_person",
+    "install_mobile1",
+    "install_address",
+]
+ALL_COLUMNS = DATA_COLUMNS + \
+    ["proposed_date", "WhatsApp Message", "WhatsApp Link"]
+
+
+def clean_phone_for_wa(raw):
+    """
+    Strips everything except digits, then converts a local Malaysian
+    mobile number (leading 0, e.g. "012-345 6789") into the international
+    format wa.me links need (leading 60, no separators, e.g.
+    "60123456789"). A number that's already in some other international
+    format (doesn't start with 0 after stripping) is left as digits-only
+    — we can't safely guess a country code that isn't already there.
+    Returns "" if there's nothing usable.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return ""
+    if digits.startswith("0"):
+        digits = "60" + digits[1:]
+    return digits
+
+
+def message_formula(row):
+    """
+    Excel formula for one row's WhatsApp Message cell, matching the
+    copywriting/formatting shown in the reference screenshot. Single
+    asterisks are WhatsApp's own bold syntax, not markdown. Column
+    letters below map to DATA_COLUMNS' order: A=sales_no,
+    C=sales_info_product, F=install_address, G=proposed_date.
+
+    Note: if you copy this CELL (Ctrl+C, not double-click) and paste
+    into something like Notepad, you'll see the whole value wrapped in
+    quotes. That's Excel's own clipboard behavior (CSV-style quoting)
+    kicking in because the text contains commas and line breaks — it's
+    not part of the cell's actual value or this formula, and it doesn't
+    matter once you're using the WhatsApp Link column instead of
+    copying this text by hand.
+    """
+    tarikh_part = (
+        f'IFERROR(TEXT(G{row},"DD/MM/YYYY") & " (" & '
+        f'CHOOSE(WEEKDAY(G{row},2),"Isnin","Selasa","Rabu","Khamis","Jumaat","Sabtu","Ahad") & ")", G{row})'
+    )
+    return (
+        f'=IF(G{row}="","","Selamat sejahtera Tuan/Puan," & CHAR(10) & CHAR(10) & '
+        f'"Saya *Hanis*, CUCKOO+ Service Specialist (NDS35095). Saya memohon maaf jika saya menghubungi anda pada waktu yang tidak sesuai." & CHAR(10) & CHAR(10) & '
+        f'"Saya ingin mengesahkan jika saya boleh membuat lawatan servis seperti di bawah." & CHAR(10) & CHAR(10) & '
+        f'"*Tarikh:* " & {tarikh_part} & CHAR(10) & '
+        f'"*Alamat:* " & F{row} & CHAR(10) & '
+        f'"*Produk:* " & C{row} & CHAR(10) & '
+        f'"*Nombor Pesanan:* " & A{row} & CHAR(10) & CHAR(10) & '
+        f'"Terima kasih, sokongan dan kerjasama Tuan/Puan amat saya hargai.")'
+    )
+
+
+def wa_link_formula(row, phone_digits):
+    """
+    Excel formula for one row's WhatsApp Link cell.
+
+    IMPORTANT LIMITATION: this can't pre-fill the message the way a
+    wa.me "?text=" link normally would. Excel's own HYPERLINK() worksheet
+    function hard-caps its link_location argument at 255 characters —
+    if it's longer, Excel returns #VALUE! instead of opening anything.
+    The encoded message (greeting + explanation + address etc.) is
+    always well past that, no matter how it's trimmed, so a formula-
+    based link genuinely cannot carry the pre-filled text.
+
+    What this DOES do: opens the right WhatsApp chat directly (a plain
+    "https://wa.me/<number>" link, comfortably under 255 chars), so you
+    only need to copy the WhatsApp Message cell (column H) and paste it
+    in — no manual number lookup or searching for the contact.
+    """
+    if not phone_digits:
+        return '="No phone number found"'
+    return (
+        f'=IF(G{row}="","",HYPERLINK('
+        f'"https://wa.me/{phone_digits}",'
+        f'"Open WhatsApp Chat"))'
+    )
+
+
+def _populate_sheet(ws, records):
+    """
+    Fills in headers + rows on an already-created worksheet (either a
+    fresh one, or the one already inside the macro-enabled template).
+    Shared by both output paths in write_output() below so the two
+    stay in sync automatically.
+    """
+    FONT = "Arial"
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    input_fill = PatternFill("solid", fgColor="FFF2CC")
+
+    for col_idx, header in enumerate(ALL_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(
+            wrap_text=True, vertical="center", horizontal="center")
+    ws["G1"].comment = Comment(
+        "Type a date here as DD/MM/YYYY (e.g. 08/08/2026).\n"
+        "The WhatsApp Message and WhatsApp Link columns fill themselves in automatically.",
+        "cuckoo_scraper.py"
+    )
+    ws["I1"].comment = Comment(
+        "Click to open the right WhatsApp chat directly, then copy the\n"
+        "message from column H and paste it in. (Excel's HYPERLINK function\n"
+        "can't carry a pre-filled message this long — it caps links at 255\n"
+        "characters — so this gets you to the chat, but the message still\n"
+        "needs one paste.)\n\n"
+        "If this file has the WhatsApp macro installed (see write_output()'s\n"
+        "docstring in cuckoo_scraper.py), double-click instead of single-\n"
+        "clicking — that opens the chat with the message already filled in,\n"
+        "no paste needed.",
+        "cuckoo_scraper.py"
+    )
+    ws["J1"] = "wa_number"
+    ws["J1"].font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
+    ws["J1"].fill = header_fill
+    ws["J1"].comment = Comment(
+        "Internal use only — the macro reads this to build the full "
+        "pre-filled WhatsApp link. Don't edit or delete this column.",
+        "cuckoo_scraper.py"
+    )
+
+    for row_idx, record in enumerate(records, start=2):
+        for col_idx, field in enumerate(DATA_COLUMNS, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx,
+                           value=record.get(field, ""))
+            cell.font = Font(name=FONT, size=10)
+
+        g_cell = ws.cell(row=row_idx, column=7,
+                         value=record.get("proposed_date"))
+        g_cell.font = Font(name=FONT, size=10)
+        g_cell.fill = input_fill
+
+        h_cell = ws.cell(row=row_idx, column=8, value=message_formula(row_idx))
+        h_cell.font = Font(name=FONT, size=10)
+        h_cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        phone_digits = clean_phone_for_wa(record.get("install_mobile1", ""))
+        i_cell = ws.cell(row=row_idx, column=9,
+                         value=wa_link_formula(row_idx, phone_digits))
+        i_cell.font = Font(name=FONT, size=10,
+                           color="1155CC", underline="single")
+
+        # Hidden helper column — the macro (if installed) reads this
+        # directly instead of re-deriving the phone number itself.
+        j_cell = ws.cell(row=row_idx, column=10, value=phone_digits)
+        j_cell.font = Font(name=FONT, size=10)
+
+    widths = {"A": 14, "B": 12, "C": 16, "D": 26,
+              "E": 16, "F": 40, "G": 14, "H": 60, "I": 18, "J": 12}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    ws.column_dimensions["J"].hidden = True
+    ws.freeze_panes = "A2"
+
+
+def write_output(records):
+    """
+    Writes the export with only the 6 requested fields, plus
+    proposed_date (typed by hand), WhatsApp Message (fills itself in
+    the moment a date is typed), and WhatsApp Link.
+
+    TWO POSSIBLE OUTPUTS, chosen automatically:
+
+    1. If TEMPLATE_FILE ("cuckoo_export_template.xlsm") exists, this
+       writes INTO a copy of it (loaded with keep_vba=True so its
+       macro survives) and saves as OUTPUT_FILE_XLSM. In that file,
+       double-clicking a WhatsApp Link cell runs the macro, which opens
+       WhatsApp with the message already filled in — no paste needed,
+       because VBA's FollowHyperlink isn't subject to the 255-character
+       cap that the HYPERLINK() *formula* has.
+
+    2. Otherwise, this falls back to a plain OUTPUT_FILE (.xlsx) with
+       no macro — the WhatsApp Link column still works via single
+       click, it just opens the bare chat (see wa_link_formula()'s
+       docstring) rather than pre-filling the message.
+
+    ONE-TIME SETUP for option 1 (only needs doing once, ever —
+    openpyxl can't write compiled VBA itself, so this part is manual):
+      a. Run the script once normally so a plain cuckoo_export.xlsx
+         exists with the columns/formulas already in it.
+      b. Open that file in Excel. Press Alt+F11 to open the VBA editor.
+      c. In the Project pane on the left, double-click the entry for
+         this sheet (e.g. "Sheet1 (Cuckoo Export)") — NOT "Insert >
+         Module". This must be the sheet's own code-behind so the
+         double-click event actually fires.
+      d. Paste in:
+
+           Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, ByVal Cancel As Boolean)
+               Dim r As Long, num As String, msg As String, url As String
+               If Target.Column <> 9 Then Exit Sub   ' column I = WhatsApp Link
+               r = Target.Row
+               If r < 2 Then Exit Sub
+               num = Trim(Cells(r, "J").Value)       ' hidden helper column
+               msg = Cells(r, "H").Value              ' WhatsApp Message
+               If num = "" Or msg = "" Then Exit Sub
+               ' web.whatsapp.com (not wa.me) on purpose — wa.me links often
+               ' get intercepted by WhatsApp Desktop if it's installed, and
+               ' the desktop app silently drops the pre-filled text for a
+               ' chat that already exists. Routing through web.whatsapp.com
+               ' forces it into an actual browser tab, where the text
+               ' reliably shows up.
+               url = "https://web.whatsapp.com/send?phone=" & num & "&text=" & WorksheetFunction.EncodeURL(msg)
+               ActiveWorkbook.FollowHyperlink Address:=url, NewWindow:=True
+               Cancel = True
+           End Sub
+
+      e. Close the VBA editor. File > Save As > "Excel Macro-Enabled
+         Workbook (*.xlsm)" > save it as exactly
+         "cuckoo_export_template.xlsm", in the same folder this script
+         runs from.
+      f. From then on, every run of this script detects that file and
+         writes into it automatically — this setup never needs
+         repeating.
+    """
     if not records:
         print("No records captured — nothing written.")
-        return
-    fieldnames = sorted({key for r in records for key in r.keys()})
+        return OUTPUT_FILE
 
-    # Excel treats any CSV cell starting with +, -, or = as the start of a
-    # formula (e.g. "+60-127156860" gets evaluated as 60 minus 127156860).
-    # A leading apostrophe tells Excel "this is literal text" and is not
-    # shown in the cell — this keeps phone numbers displaying correctly.
-    def excel_safe(value):
-        if isinstance(value, str) and value[:1] in ("+", "-", "="):
-            return "'" + value
-        return value
+    records = sorted(records, key=lambda r: r.get("sales_no", ""))
 
-    safe_records = [{k: excel_safe(v) for k, v in r.items()} for r in records]
+    if os.path.exists(TEMPLATE_FILE):
+        try:
+            wb = openpyxl.load_workbook(TEMPLATE_FILE, keep_vba=True)
+            ws = wb.active
+            # Clear out any previous run's rows before writing fresh ones,
+            # but leave row 1 (headers) and the macro itself untouched.
+            if ws.max_row > 1:
+                ws.delete_rows(2, ws.max_row - 1)
+            _populate_sheet(ws, records)
+            wb.save(OUTPUT_FILE_XLSM)
+            return OUTPUT_FILE_XLSM
+        except Exception as e:
+            print(f"  !! Could not write into {TEMPLATE_FILE} ({e}) — "
+                  f"falling back to a plain .xlsx instead.")
 
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(safe_records)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Cuckoo Export"
+    _populate_sheet(ws, records)
+    wb.save(OUTPUT_FILE)
+    return OUTPUT_FILE
 
 
 if __name__ == "__main__":
