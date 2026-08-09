@@ -1,4 +1,6 @@
 venv/
-cuckoo_export.csv
 __pycache__/
 *.pyc
+cuckoo_export.xlsm
+geocode_cache.json
+route_map.html
