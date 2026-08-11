@@ -86,9 +86,9 @@ APP_PACKAGE = "cuckoo.doctress"
 # confirmed: the list screen
 APP_ACTIVITY = "cuckoo.doctress.naturalcareservicelist"
 
-LIST_LIMIT = None   # was 3 for testing — now processes the whole list
+LIST_LIMIT = 4   # was 3 for testing — now processes the whole list
 # set True again only if something breaks and you need to see raw element data
-DEBUG = False
+DEBUG = True
 
 # --- List screen (confirmed from XML) ---
 LABEL_FIELD_MAP = {
@@ -613,6 +613,168 @@ def read_full_detail(driver):
 
 
 # ============================================================
+# Detail screen: CCS Note popup (filter/consumable change data)
+# ============================================================
+#
+# A scrollable list of "cards" — one per physical filter/consumable UNIT
+# installed, which is why the exact same product can appear several
+# times in a row (e.g. "FT-1001 Sediment Filter 8 Inch" showing up 6
+# times for one customer, because they have 6 identical units). Each
+# full card has: a product name, a small per-unit number (1, 2, 3...),
+# an interval like "(4 months)", "Last Change" -> a date, "Next Change"
+# -> a date. Only product name + Last Change date are actually kept —
+# interval and Next Change aren't part of what's needed here.
+#
+# A card is only kept if BOTH of these hold:
+#   - its product name is real text, not a bare number and not the
+#     literal label "Last Change"/"Next Change"
+#   - it has a non-empty Last Change date
+# Both checks exist because of a real, confirmed pattern in captured
+# data: alongside each genuine card, the same screen sometimes also
+# yields a partial/garbled read of it — either the standalone "Next
+# Change" label picked up on its own, or the small per-unit number
+# landing where the product name should be — and in every observed
+# case, that garbled read has a BLANK Last Change while the genuine
+# card next to it doesn't. Filtering on "has a real name AND has a
+# Last Change" reliably keeps the real entries and drops the artifacts.
+#
+# "Unique" cards: product name + Last Change date must both match for
+# two cards to be treated as duplicates and collapsed into one
+# (CCS_DEDUP_FIELDS below). The small per-unit number is deliberately
+# not part of that — this is what collapses several near-identical
+# "FT-1001 Sediment Filter 8 Inch" cards, differing only by unit
+# number, into a single row.
+
+CCS_DEDUP_FIELDS = ("product", "last_change")
+# Safety cap on scrolling WITHIN one customer's CCS Note screen — same
+# spirit as MAX_SCROLLS above, just a separate, smaller budget since
+# this screen has far fewer cards than the full customer list does.
+MAX_CCS_CARD_SCROLLS = 30
+
+_CCS_RESERVED_LABELS = {"Last Change", "Next Change"}
+
+
+def _is_valid_ccs_product_name(product):
+    if not product:
+        return False
+    if product in _CCS_RESERVED_LABELS:
+        return False
+    if product.strip().isdigit():
+        return False
+    return True
+
+
+def get_ccs_note_cards(driver):
+    """Reads every currently-visible card on the CCS Note screen,
+    keeping only ones that pass the validity checks above."""
+    wait_for(driver, (AppiumBy.XPATH, '//android.widget.TextView[@text="CCS Note"]'))
+
+    card_elements = driver.find_elements(
+        AppiumBy.XPATH,
+        '//androidx.viewpager.widget.ViewPager//android.view.ViewGroup[@clickable="true"]'
+    )
+
+    cards = []
+    for card_el in card_elements:
+        parsed = parse_bounds(card_el.get_attribute("bounds"))
+        if not parsed:
+            continue
+        text_elements = card_el.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+        texts = [read_text_safe(t) for t in text_elements]
+        texts = [t for t in texts if t]  # drop empty separator TextViews
+
+        if not texts:
+            continue
+
+        product = texts[0]
+        last_change = ""
+        for i, t in enumerate(texts):
+            if t == "Last Change" and i + 1 < len(texts):
+                last_change = texts[i + 1]
+
+        if not _is_valid_ccs_product_name(product):
+            continue
+
+        cards.append({
+            "product": product,
+            "last_change": last_change,
+            "card_top_y": parsed[1],
+        })
+
+    return cards
+
+
+def get_all_ccs_note_cards(driver):
+    """
+    Scrolls through the whole CCS Note screen, collecting cards as it
+    goes. Deduplicates along the way using CCS_DEDUP_FIELDS — this
+    collapses both genuinely repeated cards (same product/last change,
+    different unit number) AND the same card being seen twice after a
+    small scroll, with the same check. Finishes with a reconciliation
+    pass (see _reconcile_ccs_cards) that separates real "not yet
+    serviced" entries from parsing artifacts.
+    """
+    seen_keys = set()
+    unique_cards = []
+    scroll_count = 0
+    stagnant_rounds = 0
+
+    while scroll_count < MAX_CCS_CARD_SCROLLS and stagnant_rounds < MAX_STAGNANT_ROUNDS:
+        cards = get_ccs_note_cards(driver)
+        if not cards:
+            break
+
+        new_this_round = 0
+        for card in cards:
+            key = tuple(card[f] for f in CCS_DEDUP_FIELDS)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_cards.append(card)
+            new_this_round += 1
+
+        stagnant_rounds = 0 if new_this_round > 0 else stagnant_rounds + 1
+
+        target_percent = compute_scroll_percent(driver, cards[-1]["card_top_y"])
+        scroll_down(driver, percent=target_percent)
+        scroll_count += 1
+
+    return _reconcile_ccs_cards(unique_cards)
+
+
+def _reconcile_ccs_cards(cards):
+    """
+    Separates real "not yet serviced" entries from parsing artifacts —
+    both look identical in isolation (same product, blank Last Change),
+    so this has to look at each PRODUCT's entries together to tell them
+    apart:
+
+      - If a product has at least one entry WITH a Last Change date,
+        any blank-date entries for that same product are almost
+        certainly a partial/duplicate read of that same card (a
+        confirmed real pattern — see get_ccs_note_cards' docstring),
+        so they're dropped. Every distinct dated entry is kept (a
+        product can legitimately have more than one physical unit,
+        serviced on different dates).
+      - If a product has NO dated entry at all, it's kept as-is with a
+        blank date — that's a genuine filter that just hasn't had its
+        first change recorded yet, not an artifact.
+    """
+    by_product = {}
+    for card in cards:
+        by_product.setdefault(card["product"], []).append(card)
+
+    reconciled = []
+    for product, product_cards in by_product.items():
+        dated = [c for c in product_cards if c["last_change"]]
+        if dated:
+            reconciled.extend(dated)
+        else:
+            reconciled.append(product_cards[0])
+    return reconciled
+
+
+# ============================================================
 # Main loop: scroll + scrape until nothing new appears
 # ============================================================
 
@@ -621,6 +783,7 @@ def run():
     time.sleep(3)
 
     all_records = []
+    all_ccs_rows = []
     seen_keys = set()
     stagnant_rounds = 0
     scroll_count = 0
@@ -703,46 +866,98 @@ def run():
                     raise RuntimeError(
                         "No 'View Order' button found near this customer's row")
 
+                # --- Visit 1: View Order (sales/install details) ---
                 try:
-                    tap_element(driver, button)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"[stage: tapping row button] {type(e).__name__}: {e}")
+                    try:
+                        tap_element(driver, button)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: tapping row button] {type(e).__name__}: {e}")
 
+                    try:
+                        # select_popup_option() already waits/polls for the popup
+                        # to appear — no fixed sleep needed before it.
+                        select_popup_option(driver, "View Order")
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: selecting 'View Order' from popup] {type(e).__name__}: {e}")
+
+                    try:
+                        wait_for(
+                            driver, (AppiumBy.XPATH, '//android.widget.Button[@text="Customer Information"]'))
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: waiting for Customer Information screen] {type(e).__name__}: {e}")
+
+                    try:
+                        detail = read_full_detail(driver)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: reading detail screen fields] {type(e).__name__}: {e}")
+
+                    all_records.append({**next_row, **detail})
+                except Exception as e:
+                    print(f"  !! Skipped View Order for {key}: {e}")
+                finally:
+                    driver.back()
+                    # get_visible_customers() below already waits/polls for "NS
+                    # No" to reappear, so no sleep needed here.
+
+                # --- Visit 2: CCS Note (filter/consumable change data) ---
+                # A fresh element lookup is required here — the `button`
+                # WebElement from before driver.back() is stale now (the
+                # underlying UI tree changed), so it can't just be reused for
+                # a second tap the way it could within a single visit.
                 try:
-                    # select_popup_option() already waits/polls for the popup
-                    # to appear — no fixed sleep needed before it.
-                    select_popup_option(driver, "View Order")
-                except Exception as e:
-                    raise RuntimeError(
-                        f"[stage: selecting 'View Order' from popup] {type(e).__name__}: {e}")
+                    try:
+                        customers_again = get_visible_customers_stable(driver)
+                        this_customer_again = next(
+                            (c for c in customers_again if c["row"].get(KEY_FIELD) == key), None)
+                        if this_customer_again is None or this_customer_again["button"] is None:
+                            raise RuntimeError(
+                                "Could not re-find this customer's row for CCS Note")
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: re-finding row after View Order] {type(e).__name__}: {e}")
 
-                try:
-                    wait_for(
-                        driver, (AppiumBy.XPATH, '//android.widget.Button[@text="Customer Information"]'))
-                except Exception as e:
-                    raise RuntimeError(
-                        f"[stage: waiting for Customer Information screen] {type(e).__name__}: {e}")
+                    try:
+                        tap_element(driver, this_customer_again["button"])
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: tapping row button] {type(e).__name__}: {e}")
 
-                try:
-                    detail = read_full_detail(driver)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"[stage: reading detail screen fields] {type(e).__name__}: {e}")
+                    try:
+                        select_popup_option(driver, "CCS Note")
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: selecting 'CCS Note' from popup] {type(e).__name__}: {e}")
 
-                all_records.append({**next_row, **detail})
+                    try:
+                        cards = get_all_ccs_note_cards(driver)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"[stage: reading CCS Note cards] {type(e).__name__}: {e}")
+
+                    for card in cards:
+                        all_ccs_rows.append({
+                            "sales_no": next_row.get("sales_no", ""),
+                            "cust_name": next_row.get("cust_name", ""),
+                            "product": card["product"],
+                            "last_change": card["last_change"],
+                        })
+                except Exception as e:
+                    print(f"  !! Skipped CCS Note for {key}: {e}")
+                finally:
+                    driver.back()
             except Exception as e:
-                print(f"  !! Skipped {key} due to error: {e}")
-            finally:
-                driver.back()
-                # get_visible_customers() at the top of the next loop already
-                # waits/polls for "NS No" to reappear, so no sleep needed here.
+                print(f"  !! Skipped {key} entirely due to error: {e}")
 
     finally:
         driver.quit()
 
-    written_to = write_output(all_records)
-    print(f"Done. Wrote {len(all_records)} records to {written_to}")
+    written_to = write_output(all_records, all_ccs_rows)
+    print(f"Done. Wrote {len(all_records)} record(s) and {len(all_ccs_rows)} "
+          f"CCS Note row(s) to {written_to}")
 
 
 # ============================================================
@@ -888,8 +1103,7 @@ def _populate_sheet(ws, records):
                            value=record.get(field, ""))
             cell.font = Font(name=FONT, size=10)
 
-        g_cell = ws.cell(row=row_idx, column=7,
-                         value=record.get("proposed_date"))
+        g_cell = ws.cell(row=row_idx, column=7, value=record.get("proposed_date"))
         g_cell.font = Font(name=FONT, size=10)
         g_cell.fill = input_fill
 
@@ -900,8 +1114,7 @@ def _populate_sheet(ws, records):
         phone_digits = clean_phone_for_wa(record.get("install_mobile1", ""))
         i_cell = ws.cell(row=row_idx, column=9,
                          value=wa_link_formula(row_idx, phone_digits))
-        i_cell.font = Font(name=FONT, size=10,
-                           color="1155CC", underline="single")
+        i_cell.font = Font(name=FONT, size=10, color="1155CC", underline="single")
 
         # Hidden helper column — the macro (if installed) reads this
         # directly instead of re-deriving the phone number itself.
@@ -916,11 +1129,66 @@ def _populate_sheet(ws, records):
     ws.freeze_panes = "A2"
 
 
-def write_output(records):
+def _populate_ccs_notes_sheet(wb, ccs_rows):
+    """
+    Adds/replaces a "CCS Notes" sheet on the given workbook — ONE row
+    per customer (sales_no/cust_name shown once, not repeated per
+    filter), with all of that customer's filters combined into a
+    single "Filters" cell: one "Product Name: last change date" line
+    per filter, separated by a real line break (CHAR(10)) so it reads
+    exactly like pressing Alt+Enter between each one in Excel — the
+    cell's wrap_text is on so those show as separate visual lines.
+    """
+    if "CCS Notes" in wb.sheetnames:
+        del wb["CCS Notes"]
+    if not ccs_rows:
+        return
+    ws = wb.create_sheet("CCS Notes")
+
+    # Group rows by customer, preserving first-seen order, and sort each
+    # customer's filters alphabetically by product name for a
+    # consistent, easy-to-scan read.
+    by_customer = {}
+    for r in ccs_rows:
+        key = r["sales_no"]
+        by_customer.setdefault(key, {"cust_name": r["cust_name"], "filters": []})
+        by_customer[key]["filters"].append((r["product"], r["last_change"]))
+
+    FONT = "Arial"
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    headers = ["sales_no", "cust_name", "Filters"]
+    for col_idx, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell.font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+
+    for row_idx, (sales_no, info) in enumerate(by_customer.items(), start=2):
+        filters_sorted = sorted(info["filters"], key=lambda f: f[0])
+        filters_text = "\n".join(
+            f"{product}: {last_change if last_change else 'not yet changed'}"
+            for product, last_change in filters_sorted
+        )
+
+        ws.cell(row=row_idx, column=1, value=sales_no).font = Font(name=FONT, size=10)
+        ws.cell(row=row_idx, column=2, value=info["cust_name"]).font = Font(name=FONT, size=10)
+        filters_cell = ws.cell(row=row_idx, column=3, value=filters_text)
+        filters_cell.font = Font(name=FONT, size=10)
+        filters_cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    widths = {"A": 14, "B": 24, "C": 50}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+
+
+def write_output(records, ccs_rows=None):
     """
     Writes the export with only the 6 requested fields, plus
     proposed_date (typed by hand), WhatsApp Message (fills itself in
-    the moment a date is typed), and WhatsApp Link.
+    the moment a date is typed), and WhatsApp Link — plus a "CCS Notes"
+    sheet (filter/consumable change data) in the SAME workbook if
+    ccs_rows is given.
 
     TWO POSSIBLE OUTPUTS, chosen automatically:
 
@@ -948,7 +1216,7 @@ def write_output(records):
          double-click event actually fires.
       d. Paste in:
 
-           Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, ByVal Cancel As Boolean)
+           Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
                Dim r As Long, num As String, msg As String, url As String
                If Target.Column <> 9 Then Exit Sub   ' column I = WhatsApp Link
                r = Target.Row
@@ -975,6 +1243,8 @@ def write_output(records):
          writes into it automatically — this setup never needs
          repeating.
     """
+    ccs_rows = ccs_rows or []
+
     if not records:
         print("No records captured — nothing written.")
         return OUTPUT_FILE
@@ -990,6 +1260,7 @@ def write_output(records):
             if ws.max_row > 1:
                 ws.delete_rows(2, ws.max_row - 1)
             _populate_sheet(ws, records)
+            _populate_ccs_notes_sheet(wb, ccs_rows)
             wb.save(OUTPUT_FILE_XLSM)
             return OUTPUT_FILE_XLSM
         except Exception as e:
@@ -1000,6 +1271,7 @@ def write_output(records):
     ws = wb.active
     ws.title = "Cuckoo Export"
     _populate_sheet(ws, records)
+    _populate_ccs_notes_sheet(wb, ccs_rows)
     wb.save(OUTPUT_FILE)
     return OUTPUT_FILE
 

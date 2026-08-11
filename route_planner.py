@@ -1,44 +1,58 @@
 """
-Cuckoo+ Service Specialist — address grouping / map
+Cuckoo+ Service Specialist — address grouping
 
 Run this AFTER main.py (the scraper) has produced cuckoo_export.xlsm (or
-.xlsx if you haven't set up the WhatsApp macro template). It doesn't touch
-anything the scraper wrote — it only ADDS to the same file, plus creates
-one new standalone file:
+.xlsx if you haven't set up the WhatsApp macro template), and BEFORE
+typing in proposed_date — this script never touches proposed_date or
+the WhatsApp Message/Link columns, only adds new ones, so it's safe to
+run first and see the grouping before deciding on dates.
 
   1. Geocodes each customer's install_address using OpenStreetMap's free
      Nominatim service (no API key, no account, no cost). Results are
      cached locally in geocode_cache.json, so re-running this script
      after adding a few new customers doesn't re-geocode addresses it's
      already resolved.
-  2. Groups customers by natural proximity — any two addresses within
-     CLUSTER_RADIUS_KM of each other end up in the same "Area", and that
-     chains transitively (so an area can be bigger than one circle if
-     addresses form a connected string). There's no target group size
-     and no forced day-count — areas form organically based on how
-     close things actually are, and how many houses you tackle in a
-     day, and in what order, is entirely up to you.
-  3. Writes one new "Area" column onto the existing "Cuckoo Export"
-     sheet — added at the END (column K) specifically so nothing
-     already there (the WhatsApp Message/Link formulas, the macro's
-     hidden helper column) has to move or get renumbered.
-  4. Adds a new "Route Plan" sheet: one block per area, listing its
-     stops with a Google Maps link per address — for looking one up
-     individually, not for a route in any particular order.
-  5. Writes route_map.html — an interactive map (OpenStreetMap tiles,
-     via the free Leaflet.js library, no API key) with every address
-     plotted, colored by area, so you can actually SEE where things are
-     and decide the day-by-day split and order yourself. Open it in any
-     browser.
+  2. Groups customers by Malaysia's actual administrative hierarchy —
+     state (negeri) > district (daerah) > city/town > suburb/precinct >
+     neighbourhood — pulled from OpenStreetMap's own structured address
+     breakdown for each geocoded point, rather than an arbitrary
+     distance radius. This is what correctly separates two addresses
+     that happen to be physically close but are in different named
+     areas (e.g. same precinct, different named sub-development), and
+     just as correctly keeps together addresses that share every level
+     down to neighbourhood. No target group size or day-count — groups
+     are exactly whatever the real place hierarchy says they are.
+  3. Classifies each address as "Landed" or "High-Rise" from the
+     address text itself (block/unit-code patterns and keywords like
+     BLOK, TINGKAT, PANGSAPURI, etc. mean high-rise; anything without
+     those signals is assumed landed).
+  4. Writes "Area" and "Housing Type" columns onto the existing "Cuckoo
+     Export" sheet — added at the END (columns K, L) specifically so
+     nothing already there (the WhatsApp Message/Link formulas, the
+     macro's hidden helper column) has to move or get renumbered.
+  5. Adds a new "Route Plan" sheet — ONE sorted view: grouped by Area,
+     and within each area split into a Landed block and a High-Rise
+     block, each listing its stops with a Google Maps link per address.
+
+Note on why the main "Cuckoo Export" sheet itself isn't physically
+re-sorted by Area/Housing Type: its formulas (WhatsApp Message/Link)
+are written as plain text with hardcoded row numbers, not real Excel
+relative references — openpyxl has no concept of formula semantics, so
+if this script moved rows around, those formulas would silently end up
+pointing at the wrong row's data. The Route Plan sheet is pure values
+with no formulas, so it's completely safe to sort there instead — if
+you want the main sheet sorted too, Excel's own Data > Sort (done by
+you, in Excel, not by this script) handles relative references
+correctly and won't have this problem.
 
 ADDRESSES THAT DON'T GEOCODE
 -----------------------------
 Some addresses (especially very detailed ones — specific block/unit
 numbers) won't resolve on the first try. This script automatically
-retries using just the postcode if the full address fails. If that
-still fails, the customer is listed separately at the bottom of the
-Route Plan sheet under "Could not place automatically", and left off
-the map — you'll need to place those manually.
+retries using a simplified, street/precinct-level version of the
+address if the full one fails. If that still fails, the customer is
+listed separately at the bottom of the Route Plan sheet under "Could
+not place automatically" — you'll need to place those manually.
 
 NOMINATIM USAGE NOTE
 -----------------------------
@@ -51,7 +65,6 @@ addresses this is very low volume.
 """
 
 import json
-import math
 import os
 import re
 import time
@@ -71,13 +84,6 @@ OUTPUT_FILE_XLSM = "cuckoo_export.xlsm"
 OUTPUT_FILE_XLSX = "cuckoo_export.xlsx"
 
 GEOCODE_CACHE_FILE = "geocode_cache.json"
-MAP_HTML_FILE = "route_map.html"
-
-# Two addresses within this distance of each other land in the same
-# Area — and that chains, so an area can span further than one circle
-# if addresses form a connected string. Raise this for fewer, bigger
-# areas; lower it for more, smaller ones.
-CLUSTER_RADIUS_KM = 2.0
 
 # A geocoding match is rejected as "too broad to be useful" if its
 # bounding box spans more than this many degrees in either direction
@@ -123,7 +129,8 @@ def save_geocode_cache(cache):
 
 def _nominatim_query(params):
     """One rate-limited request to Nominatim. Returns the raw first
-    result dict (with lat/lon/boundingbox/etc.) or None."""
+    result dict (with lat/lon/boundingbox/address/etc.) or None."""
+    params = {**params, "addressdetails": 1}
     url = NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(
         url, headers={"User-Agent": NOMINATIM_USER_AGENT})
@@ -136,6 +143,49 @@ def _nominatim_query(params):
     if not results:
         return None
     return results[0]
+
+
+# Each entry: (canonical level name, candidate OSM/Nominatim field names
+# to check, in order). Malaysia's real admin hierarchy is Negeri (state)
+# > Daerah (district) > Bandar/Pekan (city/town) > Presint/Taman/Mukim
+# (suburb) > a finer named pocket within that (neighbourhood) — but OSM
+# contributors don't always tag things under the exact same field name,
+# so each level checks a few plausible alternates.
+_HIERARCHY_LEVELS = [
+    ("state", ["state"]),
+    ("district", ["state_district", "county"]),
+    ("city", ["city", "town", "municipality"]),
+    ("suburb", ["suburb", "city_district", "borough"]),
+    ("neighbourhood", ["neighbourhood", "quarter", "residential", "hamlet"]),
+]
+
+
+def extract_hierarchy(result):
+    """
+    Pulls a (state, district, city, suburb, neighbourhood) tuple out of
+    a Nominatim result's structured "address" breakdown — this is what
+    actually drives grouping now, instead of a raw distance radius.
+    Missing levels come through as None (e.g. a smaller town might have
+    no separate "district" tag) — this generally still groups correctly
+    with other addresses missing the same level, it just means that
+    level isn't part of what distinguishes them.
+    """
+    address = result.get("address", {}) if result else {}
+    levels = []
+    for _, candidates in _HIERARCHY_LEVELS:
+        value = None
+        for field in candidates:
+            if address.get(field):
+                value = address[field]
+                break
+        levels.append(value)
+    return tuple(levels)
+
+
+def hierarchy_label(hierarchy):
+    """Human-readable path, e.g. 'Selangor > Petaling > Petaling Jaya > SS2'."""
+    parts = [p for p in hierarchy if p]
+    return " > ".join(parts) if parts else "Unknown area"
 
 
 def _is_specific_enough(result):
@@ -181,9 +231,9 @@ def _simplify_to_street_level(address):
 
 def geocode_address(address, cache):
     """
-    Returns (lat, lon) or None, using the cache first. On a cache miss,
-    tries three queries in order, keeping the first that's actually
-    usable:
+    Returns {"lat": ..., "lon": ..., "hierarchy": (...)} or None, using
+    the cache first. On a cache miss, tries three queries in order,
+    keeping the first that's actually usable:
       1. The full address, as free text.
       2. A simplified version with any unmapped unit/block prefix
          stripped off (see _simplify_to_street_level) — usually
@@ -206,8 +256,16 @@ def geocode_address(address, cache):
     key = address.strip()
     if not key:
         return None
+
     if key in cache:
-        return tuple(cache[key]) if cache[key] else None
+        cached = cache[key]
+        if cached is None:
+            return None  # a previous run already tried and genuinely failed
+        if isinstance(cached, dict) and "hierarchy" in cached:
+            return {**cached, "hierarchy": tuple(cached["hierarchy"])}
+        # else: old cache format from before hierarchy tracking existed
+        # (just [lat, lon], no address breakdown) — fall through and
+        # re-geocode, since grouping now needs the hierarchy data.
 
     time.sleep(REQUEST_DELAY_SECONDS)
     result = _nominatim_query({
@@ -244,69 +302,23 @@ def geocode_address(address, cache):
                 "limit": 1,
             })
 
-    coords = (float(result["lat"]), float(result["lon"])) if result else None
     if result:
+        hierarchy = extract_hierarchy(result)
+        geocoded = {
+            "lat": float(result["lat"]),
+            "lon": float(result["lon"]),
+            "hierarchy": hierarchy,
+        }
         print(
-            f"    [geocode] \"{key[:40]}...\" -> matched \"{result.get('display_name', '?')}\"")
-    cache[key] = list(coords) if coords else None
+            f"    [geocode] \"{key[:40]}...\" -> {hierarchy_label(hierarchy)}")
+        cache[key] = {"lat": geocoded["lat"],
+                      "lon": geocoded["lon"], "hierarchy": list(hierarchy)}
+    else:
+        geocoded = None
+        cache[key] = None
+
     save_geocode_cache(cache)
-    return coords
-
-
-# ============================================================
-# Distance + natural-proximity grouping (no fixed count/size)
-# ============================================================
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    """Great-circle distance between two lat/lon points, in kilometers."""
-    R = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * \
-        math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def group_by_proximity(points, radius_km=CLUSTER_RADIUS_KM):
-    """
-    Union-find (disjoint set) over points: any two within radius_km of
-    each other get linked into the same group, and that chains — if A
-    is close to B and B is close to C, all three end up in one group
-    even if A and C themselves are farther apart than radius_km. This
-    is deliberately NOT k-means: there's no target number of groups or
-    target group size, groups just fall out of the actual geography.
-
-    Returns a list of group labels (small ints, not meaningfully
-    ordered), one per input point.
-    """
-    n = len(points)
-    parent = list(range(n))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[ri] = rj
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if haversine_km(points[i][0], points[i][1], points[j][0], points[j][1]) <= radius_km:
-                union(i, j)
-
-    roots = [find(i) for i in range(n)]
-    # Relabel roots to small consecutive ints, ordered by group size
-    # (largest first) purely so "Area 1" tends to be the biggest area
-    # rather than an arbitrary one.
-    from collections import Counter
-    order = [root for root, _ in Counter(roots).most_common()]
-    relabel = {root: idx for idx, root in enumerate(order)}
-    return [relabel[r] for r in roots]
+    return geocoded
 
 
 # ============================================================
@@ -318,147 +330,75 @@ def gmaps_single_link(lat, lon):
 
 
 # ============================================================
-# Visual map (Leaflet + OpenStreetMap tiles, no API key)
+# Landed vs high-rise classification (from the address text itself,
+# no geocoding needed)
 # ============================================================
 
-def _jitter_overlapping_markers(markers, radius_meters=15):
+_HIGH_RISE_KEYWORDS = re.compile(
+    r"\b(BLOK|BLOCK|TINGKAT|PANGSAPURI|KONDOMINIUM|CONDOMINIUM|CONDO|"
+    r"APARTMENT|FLAT|RESIDENSI|RESIDENCE|SUITES?|MENARA|TOWER|PARCEL)\b",
+    re.IGNORECASE,
+)
+# Catches block-floor-unit style codes like "A-12-05" or "A-T13-U07"
+# even when none of the keywords above happen to be present.
+_UNIT_CODE_PATTERN = re.compile(
+    r"\b[A-Z]-[A-Z]?\d+[A-Z]?-[A-Z]?\d+\b", re.IGNORECASE)
+
+
+def classify_housing_type(address):
     """
-    Fans out markers that share the exact same coordinates — very
-    common once addresses are simplified to street/precinct level,
-    since several customers in the same precinct will genuinely
-    resolve to one identical point — into a small circle around that
-    point, purely so they're visually distinguishable as separate pins
-    instead of one indistinguishable stacked dot.
-
-    COSMETIC ONLY: doesn't touch grouping (that already happened, using
-    the real coordinates), doesn't change any stored/cached coordinate,
-    and the offset is tiny (15m default) relative to CLUSTER_RADIUS_KM's
-    kilometer scale — nowhere near enough to move a marker into a
-    different area or mislead about which precinct it's actually in.
+    "Landed" or "High-Rise", guessed from the address text alone —
+    no geocoding involved, so this works even for addresses that
+    couldn't be placed on a map. Malaysian apartment/condo addresses
+    reliably include either an explicit building-type keyword (BLOK,
+    TINGKAT, PANGSAPURI, ...) or a block-floor-unit code (A-12-05,
+    A-T13-U07). Anything with neither signal is assumed landed — a
+    standalone house address is just a house number and street, with
+    nothing more specific to detect.
     """
-    groups = {}
-    for m in markers:
-        key = (round(m["lat"], 6), round(m["lon"], 6))
-        groups.setdefault(key, []).append(m)
-
-    for (lat, lon), group in groups.items():
-        n = len(group)
-        if n <= 1:
-            continue
-        lat_deg_per_m = 1 / 111320
-        lon_deg_per_m = 1 / (111320 * math.cos(math.radians(lat)) or 1)
-        for i, m in enumerate(group):
-            angle = 2 * math.pi * i / n
-            m["lat"] = lat + radius_meters * math.sin(angle) * lat_deg_per_m
-            m["lon"] = lon + radius_meters * math.cos(angle) * lon_deg_per_m
+    if _HIGH_RISE_KEYWORDS.search(address) or _UNIT_CODE_PATTERN.search(address):
+        return "High-Rise"
+    return "Landed"
 
 
-def write_map_html(geocoded, path=MAP_HTML_FILE):
+# ============================================================
+# Street-name extraction (from the address text, no geocoding needed)
+# ============================================================
+
+_STREET_PATTERN = re.compile(
+    r"\b(?:JALAN|JLN|LORONG|PERSIARAN|LEBUH|LINGKARAN)\s+"
+    r"[A-Z0-9/.\-]+(?:\s+[A-Z0-9/.\-]+)?",
+    re.IGNORECASE,
+)
+
+
+def extract_street(address):
     """
-    Writes a single self-contained HTML file with every geocoded
-    address plotted as a colored, labeled marker (color = area, so
-    areas are visually obvious at a glance). Markers sharing identical
-    coordinates get a small cosmetic offset so they're visible as
-    separate pins — see _jitter_overlapping_markers().
-
-    Leaflet's JS/CSS are embedded INLINE (read from leaflet.js and
-    leaflet.css, which need to sit in the same folder as this script)
-    rather than loaded from a CDN. A CDN-based version was tried first
-    and produced a blank page — loading external scripts into a local
-    file:// page is unreliable in practice (blocked by some firewalls,
-    ad-blockers, or simply no internet at that exact moment), often
-    with zero visible error. Bundling the library directly sidesteps
-    all of that; the only thing that still needs an internet connection
-    to display is the actual map tile imagery itself (there's no
-    reasonable way to bundle that offline).
+    Pulls out the road name/code (e.g. "JALAN P11A 1/1", "JLN TANGGILAN
+    11D/17") directly from the address text. This exists because a lot
+    of Putrajaya's internal residential lanes simply aren't in
+    OpenStreetMap's data at all — Nominatim can only place them at
+    precinct level, which is genuinely the finest grouping it can
+    support for those cases (see geocode_address's docstring). But the
+    actual street name is still sitting right there in the text even
+    when it can't be geocoded, so it's used to sort stops WITHIN an
+    area/precinct — same-lane houses end up next to each other in the
+    Route Plan sheet instead of in random order, without needing to
+    split the precinct into a separate top-level Area for every street
+    (which would fragment things into unusably tiny groups).
+    Returns "" if no street keyword is found.
     """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    leaflet_js_path = os.path.join(script_dir, "leaflet.js")
-    leaflet_css_path = os.path.join(script_dir, "leaflet.css")
-    if not os.path.exists(leaflet_js_path) or not os.path.exists(leaflet_css_path):
-        print(f"  !! leaflet.js / leaflet.css not found next to this script — "
-              f"the map can't be built without them. Make sure both files "
-              f"are in the same folder as route_planner.py.")
-        return
-    with open(leaflet_js_path, "r", encoding="utf-8") as f:
-        leaflet_js = f.read()
-    with open(leaflet_css_path, "r", encoding="utf-8") as f:
-        leaflet_css = f.read()
+    match = _STREET_PATTERN.search(address)
+    if not match:
+        return ""
+    return match.group(0).strip().upper()
 
-    markers = []
-    for r in geocoded:
-        markers.append({
-            "lat": r["lat"],
-            "lon": r["lon"],
-            "label": f"{r['contact']} ({r['sales_no']})",
-            "address": r["address"],
-            "phone": r["phone"],
-            "color": AREA_COLORS[r["area"] % len(AREA_COLORS)],
-            "area": r["area"] + 1,
-        })
-    _jitter_overlapping_markers(markers)
 
-    if markers:
-        center_lat = sum(m["lat"] for m in markers) / len(markers)
-        center_lon = sum(m["lon"] for m in markers) / len(markers)
-    else:
-        center_lat, center_lon = 3.1390, 101.6869  # fallback: KL
-
-    markers_json = json.dumps(markers, ensure_ascii=False)
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Customer Address Map</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-{leaflet_css}
-  html, body {{ margin: 0; padding: 0; height: 100%; font-family: Arial, sans-serif; }}
-  #map {{ height: 100%; width: 100%; }}
-  .popup-label {{ font-weight: bold; margin-bottom: 4px; }}
-  .popup-area {{ color: #555; font-size: 0.85em; }}
-</style>
-</head>
-<body>
-<div id="map"></div>
-<script>
-{leaflet_js}
-</script>
-<script>
-  const markers = {markers_json};
-  const map = L.map('map').setView([{center_lat}, {center_lon}], 12);
-  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    attribution: '&copy; OpenStreetMap contributors',
-    maxZoom: 19,
-  }}).addTo(map);
-
-  const bounds = [];
-  markers.forEach(m => {{
-    const marker = L.circleMarker([m.lat, m.lon], {{
-      radius: 9,
-      color: '#ffffff',
-      weight: 2,
-      fillColor: m.color,
-      fillOpacity: 0.9,
-    }}).addTo(map);
-    marker.bindPopup(
-      '<div class="popup-label">' + m.label + '</div>' +
-      '<div>' + m.address + '</div>' +
-      '<div>' + m.phone + '</div>' +
-      '<div class="popup-area">Area ' + m.area + '</div>'
-    );
-    bounds.push([m.lat, m.lon]);
-  }});
-  if (bounds.length > 0) {{
-    map.fitBounds(bounds, {{ padding: [40, 40] }});
-  }}
-</script>
-</body>
-</html>
-"""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+def _street_sort_key(street):
+    """Normalizes minor spacing inconsistencies (e.g. "P11J" vs "P11 J",
+    which really are the same road) so they sort/group together instead
+    of being treated as different streets purely due to a stray space."""
+    return street.replace(" ", "")
 
 
 # ============================================================
@@ -503,89 +443,134 @@ def run():
         print("No customer rows found in the sheet — nothing to plan.")
         return
 
+    for r in rows:
+        r["housing_type"] = classify_housing_type(r["address"])
+        r["street"] = extract_street(r["address"])
+
     print(f"Geocoding {len(rows)} address(es) (cached ones are instant, "
           f"new ones take ~1s each)...")
     cache = load_geocode_cache()
     geocoded, failed = [], []
     for i, r in enumerate(rows, start=1):
-        coords = geocode_address(r["address"], cache)
-        if coords:
-            r["lat"], r["lon"] = coords
+        result = geocode_address(r["address"], cache)
+        if result:
+            r["lat"], r["lon"], r["hierarchy"] = result["lat"], result["lon"], result["hierarchy"]
             geocoded.append(r)
         else:
             failed.append(r)
         print(f"  [{i}/{len(rows)}] {r['sales_no']}: "
-              f"{'OK' if coords else 'could not place'}")
+              f"{'OK' if result else 'could not place'}")
 
     if not geocoded:
         print("Nothing could be geocoded — check your internet connection "
               "and try again.")
         return
 
-    points = [(r["lat"], r["lon"]) for r in geocoded]
-    area_labels = group_by_proximity(points)
-    for r, area in zip(geocoded, area_labels):
-        r["area"] = area
-
     areas = {}
     for r in geocoded:
-        areas.setdefault(r["area"], []).append(r)
+        areas.setdefault(r["hierarchy"], []).append(r)
 
-    # --- Write Area onto the existing sheet, column K ---
+    # Sort by the hierarchy tuple itself — this naturally nests: all of
+    # one state sorts together, then within it all of one district, and
+    # so on down to neighbourhood. None (a level that wasn't available
+    # for a given match) sorts as "" so it doesn't crash comparing
+    # against real strings, and groups those cases first within a level.
+    def sort_key(hierarchy):
+        return tuple(level or "" for level in hierarchy)
+    sorted_hierarchies = sorted(areas.keys(), key=sort_key)
+
+    # --- Write Area + Housing Type onto the existing sheet, columns K/L ---
     FONT = "Arial"
     header_fill = PatternFill("solid", fgColor="1F4E78")
-    ws.cell(row=1, column=11, value="Area").font = Font(
-        name=FONT, size=10, bold=True, color="FFFFFF")
-    ws.cell(row=1, column=11).fill = header_fill
+    for col_idx, header in [(11, "Area"), (12, "Housing Type")]:
+        c = ws.cell(row=1, column=col_idx, value=header)
+        c.font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
+        c.fill = header_fill
 
     for r in geocoded:
         ws.cell(row=r["row_idx"], column=11,
-                value=f"Area {r['area'] + 1}").font = Font(name=FONT, size=10)
+                value=hierarchy_label(r["hierarchy"])).font = Font(name=FONT, size=10)
+        ws.cell(row=r["row_idx"], column=12,
+                value=r["housing_type"]).font = Font(name=FONT, size=10)
     for r in failed:
         ws.cell(row=r["row_idx"], column=11,
                 value="?").font = Font(name=FONT, size=10)
+        ws.cell(row=r["row_idx"], column=12,
+                value=r["housing_type"]).font = Font(name=FONT, size=10)
 
-    ws.column_dimensions["K"].width = 10
+    ws.column_dimensions["K"].width = 30
+    ws.column_dimensions["L"].width = 14
 
-    # --- Route Plan sheet ---
+    # --- Route Plan sheet: ONE sorted view — grouped by Area, and within
+    # each area split into a Landed block then a High-Rise block. This
+    # sheet is pure values (no formulas), so unlike the main sheet it's
+    # completely safe to lay out in whatever order is most useful. ---
     if "Route Plan" in wb.sheetnames:
         del wb["Route Plan"]
     rp = wb.create_sheet("Route Plan")
 
-    area_fill = PatternFill("solid", fgColor="1F4E78")
     subheader_fill = PatternFill("solid", fgColor="D9E1F2")
     r_idx = 1
 
-    for area in sorted(areas.keys()):
-        area_rows = areas[area]
-        cell = rp.cell(row=r_idx, column=1,
-                       value=f"Area {area + 1} — {len(area_rows)} address(es)")
-        cell.font = Font(name=FONT, size=12, bold=True, color="FFFFFF")
-        cell.fill = area_fill
-        rp.merge_cells(start_row=r_idx, start_column=1,
-                       end_row=r_idx, end_column=4)
-        r_idx += 1
-
-        headers = ["Sales No", "Contact", "Phone", "Address (tap to open)"]
+    def write_stop_block(rows_for_block, start_row):
+        row = start_row
+        headers = ["Sales No", "Contact", "Phone",
+                   "Street", "Address (tap to open)"]
         for col_idx, h in enumerate(headers, start=1):
-            c = rp.cell(row=r_idx, column=col_idx, value=h)
+            c = rp.cell(row=row, column=col_idx, value=h)
             c.font = Font(name=FONT, size=10, bold=True)
             c.fill = subheader_fill
-        r_idx += 1
-
-        for r in area_rows:
-            rp.cell(row=r_idx, column=1, value=r["sales_no"]).font = Font(
+        row += 1
+        # Sorting by (normalized street, sales_no) clusters same-lane
+        # houses together even within a precinct that couldn't be
+        # geocoded any finer than "Presint 11" as a whole — see
+        # extract_street()'s docstring for why this exists.
+        sorted_rows = sorted(
+            rows_for_block,
+            key=lambda r: (_street_sort_key(r["street"]), r["sales_no"]),
+        )
+        for r in sorted_rows:
+            rp.cell(row=row, column=1, value=r["sales_no"]).font = Font(
                 name=FONT, size=10)
-            rp.cell(row=r_idx, column=2, value=r["contact"]).font = Font(
+            rp.cell(row=row, column=2, value=r["contact"]).font = Font(
                 name=FONT, size=10)
-            rp.cell(row=r_idx, column=3, value=r["phone"]).font = Font(
+            rp.cell(row=row, column=3, value=r["phone"]).font = Font(
                 name=FONT, size=10)
-            addr_cell = rp.cell(row=r_idx, column=4, value=r["address"])
+            rp.cell(row=row, column=4, value=r["street"] or "?").font = Font(
+                name=FONT, size=10)
+            addr_cell = rp.cell(row=row, column=5, value=r["address"])
             addr_cell.hyperlink = gmaps_single_link(r["lat"], r["lon"])
             addr_cell.font = Font(name=FONT, size=10,
                                   color="1155CC", underline="single")
             addr_cell.alignment = Alignment(wrap_text=True)
+            row += 1
+        return row
+
+    for area_idx, hierarchy in enumerate(sorted_hierarchies):
+        area_rows = areas[hierarchy]
+        area_color = AREA_COLORS[area_idx % len(AREA_COLORS)]
+        cell = rp.cell(row=r_idx, column=1,
+                       value=f"{hierarchy_label(hierarchy)} — {len(area_rows)} address(es)")
+        cell.font = Font(name=FONT, size=12, bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=area_color.lstrip("#"))
+        rp.merge_cells(start_row=r_idx, start_column=1,
+                       end_row=r_idx, end_column=5)
+        r_idx += 1
+
+        landed = [r for r in area_rows if r["housing_type"] == "Landed"]
+        high_rise = [r for r in area_rows if r["housing_type"] == "High-Rise"]
+
+        for label, subset in [("Landed", landed), ("High-Rise", high_rise)]:
+            if not subset:
+                continue
+            sub_cell = rp.cell(row=r_idx, column=1,
+                               value=f"{label} ({len(subset)})")
+            sub_cell.font = Font(name=FONT, size=11, bold=True, italic=True)
+            rp.merge_cells(start_row=r_idx, start_column=1,
+                           end_row=r_idx, end_column=5)
             r_idx += 1
+            r_idx = write_stop_block(subset, r_idx)
+            r_idx += 1  # blank row after each sub-block
 
         r_idx += 1  # blank row between areas
 
@@ -595,33 +580,45 @@ def run():
         cell.font = Font(name=FONT, size=12, bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="C00000")
         rp.merge_cells(start_row=r_idx, start_column=1,
-                       end_row=r_idx, end_column=4)
+                       end_row=r_idx, end_column=5)
         r_idx += 1
-        for r in failed:
+        headers = ["Sales No", "Contact", "Phone",
+                   "Street", "Address", "Housing Type"]
+        for col_idx, h in enumerate(headers, start=1):
+            c = rp.cell(row=r_idx, column=col_idx, value=h)
+            c.font = Font(name=FONT, size=10, bold=True)
+            c.fill = subheader_fill
+        r_idx += 1
+        for r in sorted(failed, key=lambda r: (_street_sort_key(r["street"]), r["sales_no"])):
             rp.cell(row=r_idx, column=1, value=r["sales_no"]).font = Font(
                 name=FONT, size=10)
             rp.cell(row=r_idx, column=2, value=r["contact"]).font = Font(
                 name=FONT, size=10)
             rp.cell(row=r_idx, column=3, value=r["phone"]).font = Font(
                 name=FONT, size=10)
-            addr_cell = rp.cell(row=r_idx, column=4, value=r["address"])
+            rp.cell(row=r_idx, column=4, value=r["street"] or "?").font = Font(
+                name=FONT, size=10)
+            addr_cell = rp.cell(row=r_idx, column=5, value=r["address"])
             addr_cell.alignment = Alignment(wrap_text=True)
             addr_cell.font = Font(name=FONT, size=10)
+            rp.cell(row=r_idx, column=6, value=r["housing_type"]).font = Font(
+                name=FONT, size=10)
             r_idx += 1
 
     rp.column_dimensions["A"].width = 14
     rp.column_dimensions["B"].width = 24
     rp.column_dimensions["C"].width = 16
-    rp.column_dimensions["D"].width = 50
+    rp.column_dimensions["D"].width = 22
+    rp.column_dimensions["E"].width = 50
+    rp.column_dimensions["F"].width = 14
 
     wb.save(target_file)
-    write_map_html(geocoded)
 
     print(f"\nDone. {len(geocoded)} address(es) grouped into {len(areas)} area(s), "
           f"{len(failed)} address(es) need manual placement.")
-    print(f"Written back to {target_file} — see the 'Route Plan' sheet and "
-          f"the new Area column on 'Cuckoo Export'.")
-    print(f"Open {MAP_HTML_FILE} in a browser to see everything on a map.")
+    print(f"Written back to {target_file} — see the 'Route Plan' sheet (sorted by "
+          f"Area, then Landed/High-Rise) and the new Area/Housing Type columns "
+          f"on 'Cuckoo Export'.")
 
 
 if __name__ == "__main__":
