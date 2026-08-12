@@ -64,9 +64,12 @@ Start with LIST_LIMIT = 3. Once the export looks right, set it to
 None to process the entire list.
 """
 
+import json
 import os
 import re
 import time
+import urllib.parse
+import urllib.request
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.comments import Comment
@@ -86,9 +89,9 @@ APP_PACKAGE = "cuckoo.doctress"
 # confirmed: the list screen
 APP_ACTIVITY = "cuckoo.doctress.naturalcareservicelist"
 
-LIST_LIMIT = 4   # was 3 for testing — now processes the whole list
+LIST_LIMIT = None   # was 3 for testing — now processes the whole list
 # set True again only if something breaks and you need to see raw element data
-DEBUG = True
+DEBUG = False
 
 # --- List screen (confirmed from XML) ---
 LABEL_FIELD_MAP = {
@@ -167,6 +170,31 @@ OUTPUT_FILE = "cuckoo_export.xlsx"
 # to the plain .xlsx with a click-to-open-chat-then-paste link instead.
 TEMPLATE_FILE = "cuckoo_export_template.xlsm"
 OUTPUT_FILE_XLSM = "cuckoo_export.xlsm"
+
+# --- Route planning (address geocoding + grouping) ---
+# Runs automatically after scraping, no device/Appium involved — pure
+# address lookups against the file, writing into a "Route Plan" sheet
+# in the same workbook. Not device-dependent, so it's fine that this
+# runs after driver.quit().
+GEOCODE_CACHE_FILE = "geocode_cache.json"
+# A geocoding match is rejected as "too broad to be useful" if its
+# bounding box spans more than this many degrees in either direction
+# (roughly 0.05° ≈ 5.5km at Malaysia's latitude). This is what stops a
+# detailed address that fails to parse from silently falling back to a
+# whole-city or whole-state match.
+MAX_MATCH_SPAN_DEGREES = 0.05
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+# Nominatim's usage policy asks for an identifying User-Agent. Feel free
+# to edit this to include a real contact if you run this often.
+NOMINATIM_USER_AGENT = "cuckoo-plus-route-planner/1.0 (personal workflow tool)"
+# Their policy caps usage at 1 request/second — this stays comfortably
+# under that.
+GEOCODE_REQUEST_DELAY_SECONDS = 1.1
+AREA_COLORS = [
+    "#1f4e78", "#c00000", "#2e7d32", "#e65100", "#6a1b9a",
+    "#00838f", "#ad1457", "#4e342e", "#546e7a", "#9e9d24",
+]
+
 WAIT_SECONDS = 10
 # raised since smaller, controlled scroll steps need more of them to reach the bottom
 MAX_SCROLLS = 300
@@ -667,7 +695,8 @@ def _is_valid_ccs_product_name(product):
 def get_ccs_note_cards(driver):
     """Reads every currently-visible card on the CCS Note screen,
     keeping only ones that pass the validity checks above."""
-    wait_for(driver, (AppiumBy.XPATH, '//android.widget.TextView[@text="CCS Note"]'))
+    wait_for(driver, (AppiumBy.XPATH,
+             '//android.widget.TextView[@text="CCS Note"]'))
 
     card_elements = driver.find_elements(
         AppiumBy.XPATH,
@@ -679,7 +708,8 @@ def get_ccs_note_cards(driver):
         parsed = parse_bounds(card_el.get_attribute("bounds"))
         if not parsed:
             continue
-        text_elements = card_el.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+        text_elements = card_el.find_elements(
+            AppiumBy.CLASS_NAME, "android.widget.TextView")
         texts = [read_text_safe(t) for t in text_elements]
         texts = [t for t in texts if t]  # drop empty separator TextViews
 
@@ -735,7 +765,8 @@ def get_all_ccs_note_cards(driver):
 
         stagnant_rounds = 0 if new_this_round > 0 else stagnant_rounds + 1
 
-        target_percent = compute_scroll_percent(driver, cards[-1]["card_top_y"])
+        target_percent = compute_scroll_percent(
+            driver, cards[-1]["card_top_y"])
         scroll_down(driver, percent=target_percent)
         scroll_count += 1
 
@@ -961,21 +992,18 @@ def run():
 
 
 # ============================================================
-# Export: only the 6 requested fields, in this exact order, plus
-# proposed_date (typed by hand) and the two self-filling WhatsApp
-# columns.
+# Export column order:
+#   A=sales_no, B=appt_date, C=install_contact_person,
+#   D=install_mobile1, E=install_address, F=proposed_date (typed by
+#   hand), G=WhatsApp Link, H=sales_info_product, I=Filters (from CCS
+#   Note data), J=WhatsApp Message, K=wa_number (hidden helper).
 # ============================================================
 
-DATA_COLUMNS = [
-    "sales_no",
-    "appt_date",
-    "sales_info_product",
-    "install_contact_person",
-    "install_mobile1",
-    "install_address",
+ALL_COLUMNS = [
+    "sales_no", "appt_date", "install_contact_person", "install_mobile1",
+    "install_address", "proposed_date", "WhatsApp Link", "sales_info_product",
+    "Filters", "WhatsApp Message", "wa_number",
 ]
-ALL_COLUMNS = DATA_COLUMNS + \
-    ["proposed_date", "WhatsApp Message", "WhatsApp Link"]
 
 
 def clean_phone_for_wa(raw):
@@ -1001,8 +1029,8 @@ def message_formula(row):
     Excel formula for one row's WhatsApp Message cell, matching the
     copywriting/formatting shown in the reference screenshot. Single
     asterisks are WhatsApp's own bold syntax, not markdown. Column
-    letters below map to DATA_COLUMNS' order: A=sales_no,
-    C=sales_info_product, F=install_address, G=proposed_date.
+    letters below map to the export column order above: A=sales_no,
+    E=install_address, F=proposed_date, H=sales_info_product.
 
     Note: if you copy this CELL (Ctrl+C, not double-click) and paste
     into something like Notepad, you'll see the whole value wrapped in
@@ -1013,16 +1041,16 @@ def message_formula(row):
     copying this text by hand.
     """
     tarikh_part = (
-        f'IFERROR(TEXT(G{row},"DD/MM/YYYY") & " (" & '
-        f'CHOOSE(WEEKDAY(G{row},2),"Isnin","Selasa","Rabu","Khamis","Jumaat","Sabtu","Ahad") & ")", G{row})'
+        f'IFERROR(TEXT(F{row},"DD/MM/YYYY") & " (" & '
+        f'CHOOSE(WEEKDAY(F{row},2),"Isnin","Selasa","Rabu","Khamis","Jumaat","Sabtu","Ahad") & ")", F{row})'
     )
     return (
-        f'=IF(G{row}="","","Selamat sejahtera Tuan/Puan," & CHAR(10) & CHAR(10) & '
+        f'=IF(F{row}="","","Selamat sejahtera Tuan/Puan," & CHAR(10) & CHAR(10) & '
         f'"Saya *Hanis*, CUCKOO+ Service Specialist (NDS35095). Saya memohon maaf jika saya menghubungi anda pada waktu yang tidak sesuai." & CHAR(10) & CHAR(10) & '
         f'"Saya ingin mengesahkan jika saya boleh membuat lawatan servis seperti di bawah." & CHAR(10) & CHAR(10) & '
         f'"*Tarikh:* " & {tarikh_part} & CHAR(10) & '
-        f'"*Alamat:* " & F{row} & CHAR(10) & '
-        f'"*Produk:* " & C{row} & CHAR(10) & '
+        f'"*Alamat:* " & E{row} & CHAR(10) & '
+        f'"*Produk:* " & H{row} & CHAR(10) & '
         f'"*Nombor Pesanan:* " & A{row} & CHAR(10) & CHAR(10) & '
         f'"Terima kasih, sokongan dan kerjasama Tuan/Puan amat saya hargai.")'
     )
@@ -1042,28 +1070,29 @@ def wa_link_formula(row, phone_digits):
 
     What this DOES do: opens the right WhatsApp chat directly (a plain
     "https://wa.me/<number>" link, comfortably under 255 chars), so you
-    only need to copy the WhatsApp Message cell (column H) and paste it
-    in — no manual number lookup or searching for the contact.
+    only need to copy the WhatsApp Message cell (column J) and paste it
+    in — no manual number lookup or searching for the contact. Column
+    letters map to the export column order above: F=proposed_date.
     """
     if not phone_digits:
         return '="No phone number found"'
     return (
-        f'=IF(G{row}="","",HYPERLINK('
+        f'=IF(F{row}="","",HYPERLINK('
         f'"https://wa.me/{phone_digits}",'
         f'"Open WhatsApp Chat"))'
     )
 
 
-def _populate_sheet(ws, records):
+def _populate_sheet(ws, records, filters_by_sales_no):
     """
     Fills in headers + rows on an already-created worksheet (either a
     fresh one, or the one already inside the macro-enabled template).
     Shared by both output paths in write_output() below so the two
-    stay in sync automatically.
+    stay in sync automatically. filters_by_sales_no maps sales_no ->
+    the combined multi-line Filters text (see _build_filters_lookup).
     """
     FONT = "Arial"
     header_fill = PatternFill("solid", fgColor="1F4E78")
-    input_fill = PatternFill("solid", fgColor="FFF2CC")
 
     for col_idx, header in enumerate(ALL_COLUMNS, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
@@ -1071,14 +1100,14 @@ def _populate_sheet(ws, records):
         cell.fill = header_fill
         cell.alignment = Alignment(
             wrap_text=True, vertical="center", horizontal="center")
-    ws["G1"].comment = Comment(
+    ws["F1"].comment = Comment(
         "Type a date here as DD/MM/YYYY (e.g. 08/08/2026).\n"
         "The WhatsApp Message and WhatsApp Link columns fill themselves in automatically.",
         "cuckoo_scraper.py"
     )
-    ws["I1"].comment = Comment(
+    ws["G1"].comment = Comment(
         "Click to open the right WhatsApp chat directly, then copy the\n"
-        "message from column H and paste it in. (Excel's HYPERLINK function\n"
+        "message from column J and paste it in. (Excel's HYPERLINK function\n"
         "can't carry a pre-filled message this long — it caps links at 255\n"
         "characters — so this gets you to the chat, but the message still\n"
         "needs one paste.)\n\n"
@@ -1088,107 +1117,497 @@ def _populate_sheet(ws, records):
         "no paste needed.",
         "cuckoo_scraper.py"
     )
-    ws["J1"] = "wa_number"
-    ws["J1"].font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
-    ws["J1"].fill = header_fill
-    ws["J1"].comment = Comment(
+    ws["K1"].comment = Comment(
         "Internal use only — the macro reads this to build the full "
         "pre-filled WhatsApp link. Don't edit or delete this column.",
         "cuckoo_scraper.py"
     )
 
     for row_idx, record in enumerate(records, start=2):
-        for col_idx, field in enumerate(DATA_COLUMNS, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx,
-                           value=record.get(field, ""))
-            cell.font = Font(name=FONT, size=10)
+        # A-E: plain scraped fields, in the specified order.
+        for col_idx, field in enumerate(
+            ["sales_no", "appt_date", "install_contact_person",
+             "install_mobile1", "install_address"], start=1
+        ):
+            ws.cell(row=row_idx, column=col_idx,
+                    value=record.get(field, "")).font = Font(name=FONT, size=10)
 
-        g_cell = ws.cell(row=row_idx, column=7, value=record.get("proposed_date"))
-        g_cell.font = Font(name=FONT, size=10)
-        g_cell.fill = input_fill
-
-        h_cell = ws.cell(row=row_idx, column=8, value=message_formula(row_idx))
-        h_cell.font = Font(name=FONT, size=10)
-        h_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        # F: proposed_date — typed by hand, no special fill (styled the
+        # same as every other cell, on request).
+        ws.cell(row=row_idx, column=6,
+                value=record.get("proposed_date")).font = Font(name=FONT, size=10)
 
         phone_digits = clean_phone_for_wa(record.get("install_mobile1", ""))
-        i_cell = ws.cell(row=row_idx, column=9,
+
+        # G: WhatsApp Link (formula)
+        g_cell = ws.cell(row=row_idx, column=7,
                          value=wa_link_formula(row_idx, phone_digits))
-        i_cell.font = Font(name=FONT, size=10, color="1155CC", underline="single")
+        g_cell.font = Font(name=FONT, size=10,
+                           color="1155CC", underline="single")
 
-        # Hidden helper column — the macro (if installed) reads this
-        # directly instead of re-deriving the phone number itself.
-        j_cell = ws.cell(row=row_idx, column=10, value=phone_digits)
-        j_cell.font = Font(name=FONT, size=10)
+        # H: sales_info_product
+        ws.cell(row=row_idx, column=8,
+                value=record.get("sales_info_product", "")).font = Font(name=FONT, size=10)
 
-    widths = {"A": 14, "B": 12, "C": 16, "D": 26,
-              "E": 16, "F": 40, "G": 14, "H": 60, "I": 18, "J": 12}
-    for col, w in widths.items():
-        ws.column_dimensions[col].width = w
-    ws.column_dimensions["J"].hidden = True
-    ws.freeze_panes = "A2"
-
-
-def _populate_ccs_notes_sheet(wb, ccs_rows):
-    """
-    Adds/replaces a "CCS Notes" sheet on the given workbook — ONE row
-    per customer (sales_no/cust_name shown once, not repeated per
-    filter), with all of that customer's filters combined into a
-    single "Filters" cell: one "Product Name: last change date" line
-    per filter, separated by a real line break (CHAR(10)) so it reads
-    exactly like pressing Alt+Enter between each one in Excel — the
-    cell's wrap_text is on so those show as separate visual lines.
-    """
-    if "CCS Notes" in wb.sheetnames:
-        del wb["CCS Notes"]
-    if not ccs_rows:
-        return
-    ws = wb.create_sheet("CCS Notes")
-
-    # Group rows by customer, preserving first-seen order, and sort each
-    # customer's filters alphabetically by product name for a
-    # consistent, easy-to-scan read.
-    by_customer = {}
-    for r in ccs_rows:
-        key = r["sales_no"]
-        by_customer.setdefault(key, {"cust_name": r["cust_name"], "filters": []})
-        by_customer[key]["filters"].append((r["product"], r["last_change"]))
-
-    FONT = "Arial"
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    headers = ["sales_no", "cust_name", "Filters"]
-    for col_idx, h in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=h)
-        cell.font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
-        cell.fill = header_fill
-        cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
-
-    for row_idx, (sales_no, info) in enumerate(by_customer.items(), start=2):
-        filters_sorted = sorted(info["filters"], key=lambda f: f[0])
-        filters_text = "\n".join(
-            f"{product}: {last_change if last_change else 'not yet changed'}"
-            for product, last_change in filters_sorted
-        )
-
-        ws.cell(row=row_idx, column=1, value=sales_no).font = Font(name=FONT, size=10)
-        ws.cell(row=row_idx, column=2, value=info["cust_name"]).font = Font(name=FONT, size=10)
-        filters_cell = ws.cell(row=row_idx, column=3, value=filters_text)
+        # I: Filters — combined text from CCS Note data, looked up by
+        # sales_no; blank if this customer had no CCS Note data captured.
+        filters_cell = ws.cell(row=row_idx, column=9,
+                               value=filters_by_sales_no.get(record.get("sales_no", ""), ""))
         filters_cell.font = Font(name=FONT, size=10)
         filters_cell.alignment = Alignment(wrap_text=True, vertical="top")
 
-    widths = {"A": 14, "B": 24, "C": 50}
+        # J: WhatsApp Message (formula)
+        j_cell = ws.cell(row=row_idx, column=10,
+                         value=message_formula(row_idx))
+        j_cell.font = Font(name=FONT, size=10)
+        j_cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        # K: wa_number — hidden helper column, the macro (if installed)
+        # reads this directly instead of re-deriving the phone number.
+        k_cell = ws.cell(row=row_idx, column=11, value=phone_digits)
+        k_cell.font = Font(name=FONT, size=10)
+
+    widths = {"A": 14, "B": 12, "C": 26, "D": 16, "E": 40, "F": 14,
+              "G": 18, "H": 16, "I": 40, "J": 60, "K": 12}
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
+    ws.column_dimensions["K"].hidden = True
     ws.freeze_panes = "A2"
+
+
+def _build_filters_lookup(ccs_rows):
+    """
+    Turns the flat list of {sales_no, cust_name, product, last_change}
+    rows from get_all_ccs_note_cards() into {sales_no: combined_text},
+    one "Product: date" line per filter (real line breaks, so it reads
+    like pressing Alt+Enter between each one), sorted alphabetically by
+    product name for a consistent read.
+    """
+    by_customer = {}
+    for r in ccs_rows:
+        by_customer.setdefault(r["sales_no"], []).append(
+            (r["product"], r["last_change"]))
+
+    lookup = {}
+    for sales_no, filters in by_customer.items():
+        filters_sorted = sorted(filters, key=lambda f: f[0])
+        lookup[sales_no] = "\n".join(
+            f"{product}: {last_change if last_change else 'not yet changed'}"
+            for product, last_change in filters_sorted
+        )
+    return lookup
+
+
+# ============================================================
+# Route planning: address geocoding + grouping (Route Plan sheet)
+# ============================================================
+#
+# Runs automatically after scraping finishes — no device/Appium
+# involved, this is pure address lookups against OpenStreetMap's free
+# Nominatim service, safe to run after driver.quit(). Builds directly
+# from the in-memory `records` list (not by re-reading the saved file's
+# cell positions — that would be fragile against future column
+# reorders, which is exactly what broke the old standalone
+# route_planner.py script's approach).
+#
+#   1. Geocodes each customer's install_address (cached locally in
+#      GEOCODE_CACHE_FILE, so re-running doesn't re-geocode addresses
+#      already resolved).
+#   2. Groups customers by Malaysia's actual administrative hierarchy —
+#      state (negeri) > district (daerah) > city/town > suburb/precinct
+#      > neighbourhood — pulled from OpenStreetMap's own structured
+#      address breakdown, rather than an arbitrary distance radius.
+#      This is what correctly separates two addresses that happen to be
+#      physically close but are in different named areas (e.g. same
+#      precinct, different named sub-development).
+#   3. Classifies each address as "Landed" or "High-Rise" from the
+#      address text itself.
+#   4. Writes a "Route Plan" sheet — ONE sorted view: grouped by Area,
+#      and within each area split into a Landed block and a High-Rise
+#      block, each listing its stops with a Google Maps link.
+#
+# ADDRESSES THAT DON'T GEOCODE: some (especially very detailed ones —
+# specific block/unit numbers) won't resolve on the first try. This
+# automatically retries using a simplified, street/precinct-level
+# version of the address if the full one fails. If that still fails,
+# the customer is listed separately at the bottom of the Route Plan
+# sheet under "Could not place automatically".
+#
+# NOMINATIM USAGE NOTE: their usage policy asks for a maximum of 1
+# request/second and an identifying User-Agent — both handled via
+# NOMINATIM_USER_AGENT / GEOCODE_REQUEST_DELAY_SECONDS in the CONFIG
+# section above.
+
+def load_geocode_cache():
+    if not os.path.exists(GEOCODE_CACHE_FILE):
+        return {}
+    try:
+        with open(GEOCODE_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_geocode_cache(cache):
+    with open(GEOCODE_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def _nominatim_query(params):
+    """One rate-limited request to Nominatim. Returns the raw first
+    result dict (with lat/lon/boundingbox/address/etc.) or None."""
+    params = {**params, "addressdetails": 1}
+    url = NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": NOMINATIM_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            results = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"    [geocode] request failed: {type(e).__name__}: {e}")
+        return None
+    if not results:
+        return None
+    return results[0]
+
+
+# Each entry: (canonical level name, candidate OSM/Nominatim field names
+# to check, in order). Malaysia's real admin hierarchy is Negeri (state)
+# > Daerah (district) > Bandar/Pekan (city/town) > Presint/Taman/Mukim
+# (suburb) > a finer named pocket within that (neighbourhood) — but OSM
+# contributors don't always tag things under the exact same field name,
+# so each level checks a few plausible alternates.
+_HIERARCHY_LEVELS = [
+    ("state", ["state"]),
+    ("district", ["state_district", "county"]),
+    ("city", ["city", "town", "municipality"]),
+    ("suburb", ["suburb", "city_district", "borough"]),
+    ("neighbourhood", ["neighbourhood", "quarter", "residential", "hamlet"]),
+]
+
+
+def extract_hierarchy(result):
+    """Pulls a (state, district, city, suburb, neighbourhood) tuple out
+    of a Nominatim result's structured "address" breakdown."""
+    address = result.get("address", {}) if result else {}
+    levels = []
+    for _, candidates in _HIERARCHY_LEVELS:
+        value = None
+        for field in candidates:
+            if address.get(field):
+                value = address[field]
+                break
+        levels.append(value)
+    return tuple(levels)
+
+
+def hierarchy_label(hierarchy):
+    """Human-readable path, e.g. 'Selangor > Petaling > Petaling Jaya > SS2'."""
+    parts = [p for p in hierarchy if p]
+    return " > ".join(parts) if parts else "Unknown area"
+
+
+def _is_specific_enough(result):
+    """
+    Rejects matches that are too broad to be useful — e.g. when a
+    detailed unit/block address doesn't parse and Nominatim quietly
+    falls back to matching just the city or state name. Left
+    unchecked, that gives every address in the same city the SAME
+    coordinates, silently producing a garbage grouping instead of an
+    honest failure. Uses the result's boundingbox width/height as a
+    proxy for how precise the match is.
+    """
+    bbox = result.get("boundingbox")
+    if not bbox:
+        return False
+    south, north, west, east = (float(x) for x in bbox)
+    return (north - south) <= MAX_MATCH_SPAN_DEGREES and (east - west) <= MAX_MATCH_SPAN_DEGREES
+
+
+def _simplify_to_street_level(address):
+    """
+    Malaysian residential addresses often lead with a unit/block/lot
+    code that essentially never exists in OpenStreetMap's data, which
+    often makes the full-address query fail entirely. This strips
+    everything before the first recognizable street/area keyword
+    (JALAN, PERSIARAN, LORONG, PRESINT, TAMAN, BANDAR, LEBUH,
+    LINGKARAN), keeping the part that's actually likely to be mapped.
+    Returns None if none of those keywords appear.
+    """
+    keywords = r"(JALAN|PERSIARAN|LORONG|PRESINT|TAMAN|BANDAR|LEBUH|LINGKARAN)"
+    match = re.search(keywords, address, re.IGNORECASE)
+    if not match:
+        return None
+    return address[match.start():]
+
+
+def geocode_address(address, cache):
+    """
+    Returns {"lat": ..., "lon": ..., "hierarchy": (...)} or None, using
+    the cache first. On a cache miss, tries three queries in order,
+    keeping the first that's actually usable: the full address; a
+    simplified street/precinct-level version; a structured postcode
+    query as a last, deliberately coarser resort (not rejected for
+    being "too broad", since it's supposed to be).
+    """
+    key = address.strip()
+    if not key:
+        return None
+
+    if key in cache:
+        cached = cache[key]
+        if cached is None:
+            return None
+        if isinstance(cached, dict) and "hierarchy" in cached:
+            return {**cached, "hierarchy": tuple(cached["hierarchy"])}
+        # else: old cache format from before hierarchy tracking existed —
+        # fall through and re-geocode.
+
+    time.sleep(GEOCODE_REQUEST_DELAY_SECONDS)
+    result = _nominatim_query({
+        "q": key, "format": "jsonv2", "countrycodes": "my", "limit": 1,
+    })
+    if result is not None and not _is_specific_enough(result):
+        result = None
+
+    if result is None:
+        simplified = _simplify_to_street_level(key)
+        if simplified:
+            time.sleep(GEOCODE_REQUEST_DELAY_SECONDS)
+            result = _nominatim_query({
+                "q": simplified, "format": "jsonv2", "countrycodes": "my", "limit": 1,
+            })
+            if result is not None and not _is_specific_enough(result):
+                result = None
+
+    if result is None:
+        postcode_match = re.search(r"\b(\d{5})\b", key)
+        if postcode_match:
+            time.sleep(GEOCODE_REQUEST_DELAY_SECONDS)
+            result = _nominatim_query({
+                "postalcode": postcode_match.group(1), "country": "Malaysia",
+                "format": "jsonv2", "limit": 1,
+            })
+
+    if result:
+        hierarchy = extract_hierarchy(result)
+        geocoded = {"lat": float(result["lat"]), "lon": float(
+            result["lon"]), "hierarchy": hierarchy}
+        print(
+            f"    [geocode] \"{key[:40]}...\" -> {hierarchy_label(hierarchy)}")
+        cache[key] = {"lat": geocoded["lat"],
+                      "lon": geocoded["lon"], "hierarchy": list(hierarchy)}
+    else:
+        geocoded = None
+        cache[key] = None
+
+    save_geocode_cache(cache)
+    return geocoded
+
+
+def gmaps_single_link(lat, lon):
+    return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+
+
+_HIGH_RISE_KEYWORDS = re.compile(
+    r"\b(BLOK|BLOCK|TINGKAT|PANGSAPURI|KONDOMINIUM|CONDOMINIUM|CONDO|"
+    r"APARTMENT|FLAT|RESIDENSI|RESIDENCE|SUITES?|MENARA|TOWER|PARCEL)\b",
+    re.IGNORECASE,
+)
+_UNIT_CODE_PATTERN = re.compile(
+    r"\b[A-Z]-[A-Z]?\d+[A-Z]?-[A-Z]?\d+\b", re.IGNORECASE)
+
+
+def classify_housing_type(address):
+    """"Landed" or "High-Rise", guessed from the address text alone —
+    keyword or block-floor-unit code (A-12-05) means high-rise,
+    anything without either signal is assumed landed."""
+    if _HIGH_RISE_KEYWORDS.search(address) or _UNIT_CODE_PATTERN.search(address):
+        return "High-Rise"
+    return "Landed"
+
+
+_STREET_PATTERN = re.compile(
+    r"\b(?:JALAN|JLN|LORONG|PERSIARAN|LEBUH|LINGKARAN)\s+"
+    r"[A-Z0-9/.\-]+(?:\s+[A-Z0-9/.\-]+)?",
+    re.IGNORECASE,
+)
+
+
+def extract_street(address):
+    """Pulls the road name/code directly from the address text — used
+    to sort stops WITHIN an area/precinct even when OSM has no data for
+    that specific lane (see geocode_address's docstring)."""
+    match = _STREET_PATTERN.search(address)
+    if not match:
+        return ""
+    return match.group(0).strip().upper()
+
+
+def _street_sort_key(street):
+    """Normalizes minor spacing (e.g. "P11J" vs "P11 J", the same
+    road) so they sort/group together."""
+    return street.replace(" ", "")
+
+
+def build_route_plan_sheet(wb, records):
+    """
+    Builds the "Route Plan" sheet directly on the given workbook, from
+    the same `records` about to be written to the Cuckoo Export sheet
+    — not by re-reading cells back out of a saved file, which would be
+    fragile against column reorders.
+    """
+    rows = [{
+        "sales_no": r.get("sales_no", ""),
+        "contact": r.get("install_contact_person", ""),
+        "phone": r.get("install_mobile1", ""),
+        "address": r.get("install_address", ""),
+    } for r in records if r.get("sales_no") and r.get("install_address")]
+
+    if not rows:
+        return
+
+    for r in rows:
+        r["housing_type"] = classify_housing_type(r["address"])
+        r["street"] = extract_street(r["address"])
+
+    print(f"Geocoding {len(rows)} address(es) for the route plan "
+          f"(cached ones are instant, new ones take ~1s each)...")
+    cache = load_geocode_cache()
+    geocoded, failed = [], []
+    for i, r in enumerate(rows, start=1):
+        result = geocode_address(r["address"], cache)
+        if result:
+            r["lat"], r["lon"], r["hierarchy"] = result["lat"], result["lon"], result["hierarchy"]
+            geocoded.append(r)
+        else:
+            failed.append(r)
+        print(
+            f"  [{i}/{len(rows)}] {r['sales_no']}: {'OK' if result else 'could not place'}")
+
+    if not geocoded and not failed:
+        return
+
+    areas = {}
+    for r in geocoded:
+        areas.setdefault(r["hierarchy"], []).append(r)
+
+    def sort_key(hierarchy):
+        return tuple(level or "" for level in hierarchy)
+    sorted_hierarchies = sorted(areas.keys(), key=sort_key)
+
+    if "Route Plan" in wb.sheetnames:
+        del wb["Route Plan"]
+    rp = wb.create_sheet("Route Plan")
+
+    FONT = "Arial"
+    subheader_fill = PatternFill("solid", fgColor="D9E1F2")
+    r_idx = 1
+
+    def write_stop_block(rows_for_block, start_row):
+        row = start_row
+        headers = ["Sales No", "Contact", "Phone",
+                   "Street", "Address (tap to open)"]
+        for col_idx, h in enumerate(headers, start=1):
+            c = rp.cell(row=row, column=col_idx, value=h)
+            c.font = Font(name=FONT, size=10, bold=True)
+            c.fill = subheader_fill
+        row += 1
+        sorted_rows = sorted(
+            rows_for_block, key=lambda r: (_street_sort_key(r["street"]), r["sales_no"]))
+        for r in sorted_rows:
+            rp.cell(row=row, column=1, value=r["sales_no"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=row, column=2, value=r["contact"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=row, column=3, value=r["phone"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=row, column=4, value=r["street"] or "?").font = Font(
+                name=FONT, size=10)
+            addr_cell = rp.cell(row=row, column=5, value=r["address"])
+            addr_cell.hyperlink = gmaps_single_link(r["lat"], r["lon"])
+            addr_cell.font = Font(name=FONT, size=10,
+                                  color="1155CC", underline="single")
+            addr_cell.alignment = Alignment(wrap_text=True)
+            row += 1
+        return row
+
+    for area_idx, hierarchy in enumerate(sorted_hierarchies):
+        area_rows = areas[hierarchy]
+        area_color = AREA_COLORS[area_idx % len(AREA_COLORS)]
+        cell = rp.cell(row=r_idx, column=1,
+                       value=f"{hierarchy_label(hierarchy)} — {len(area_rows)} address(es)")
+        cell.font = Font(name=FONT, size=12, bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=area_color.lstrip("#"))
+        rp.merge_cells(start_row=r_idx, start_column=1,
+                       end_row=r_idx, end_column=5)
+        r_idx += 1
+
+        landed = [r for r in area_rows if r["housing_type"] == "Landed"]
+        high_rise = [r for r in area_rows if r["housing_type"] == "High-Rise"]
+        for label, subset in [("Landed", landed), ("High-Rise", high_rise)]:
+            if not subset:
+                continue
+            sub_cell = rp.cell(row=r_idx, column=1,
+                               value=f"{label} ({len(subset)})")
+            sub_cell.font = Font(name=FONT, size=11, bold=True, italic=True)
+            rp.merge_cells(start_row=r_idx, start_column=1,
+                           end_row=r_idx, end_column=5)
+            r_idx += 1
+            r_idx = write_stop_block(subset, r_idx)
+            r_idx += 1
+
+        r_idx += 1
+
+    if failed:
+        cell = rp.cell(row=r_idx, column=1,
+                       value="Could not place automatically — assign manually")
+        cell.font = Font(name=FONT, size=12, bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="C00000")
+        rp.merge_cells(start_row=r_idx, start_column=1,
+                       end_row=r_idx, end_column=5)
+        r_idx += 1
+        headers = ["Sales No", "Contact", "Phone",
+                   "Street", "Address", "Housing Type"]
+        for col_idx, h in enumerate(headers, start=1):
+            c = rp.cell(row=r_idx, column=col_idx, value=h)
+            c.font = Font(name=FONT, size=10, bold=True)
+            c.fill = subheader_fill
+        r_idx += 1
+        for r in sorted(failed, key=lambda r: (_street_sort_key(r["street"]), r["sales_no"])):
+            rp.cell(row=r_idx, column=1, value=r["sales_no"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=r_idx, column=2, value=r["contact"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=r_idx, column=3, value=r["phone"]).font = Font(
+                name=FONT, size=10)
+            rp.cell(row=r_idx, column=4, value=r["street"] or "?").font = Font(
+                name=FONT, size=10)
+            addr_cell = rp.cell(row=r_idx, column=5, value=r["address"])
+            addr_cell.alignment = Alignment(wrap_text=True)
+            addr_cell.font = Font(name=FONT, size=10)
+            rp.cell(row=r_idx, column=6, value=r["housing_type"]).font = Font(
+                name=FONT, size=10)
+            r_idx += 1
+
+    rp.column_dimensions["A"].width = 14
+    rp.column_dimensions["B"].width = 24
+    rp.column_dimensions["C"].width = 16
+    rp.column_dimensions["D"].width = 22
+    rp.column_dimensions["E"].width = 50
+    rp.column_dimensions["F"].width = 14
+
+    print(f"Route plan: {len(geocoded)} address(es) grouped into {len(areas)} area(s), "
+          f"{len(failed)} need manual placement.")
 
 
 def write_output(records, ccs_rows=None):
     """
-    Writes the export with only the 6 requested fields, plus
-    proposed_date (typed by hand), WhatsApp Message (fills itself in
-    the moment a date is typed), and WhatsApp Link — plus a "CCS Notes"
-    sheet (filter/consumable change data) in the SAME workbook if
-    ccs_rows is given.
+    Writes the export with the columns in the order specified at the
+    top of this section (sales_no, appt_date, install_contact_person,
+    install_mobile1, install_address, proposed_date, WhatsApp Link,
+    sales_info_product, Filters, WhatsApp Message, wa_number) — all in
+    ONE sheet, no separate CCS Notes sheet.
 
     TWO POSSIBLE OUTPUTS, chosen automatically:
 
@@ -1206,7 +1625,10 @@ def write_output(records, ccs_rows=None):
        docstring) rather than pre-filling the message.
 
     ONE-TIME SETUP for option 1 (only needs doing once, ever —
-    openpyxl can't write compiled VBA itself, so this part is manual):
+    openpyxl can't write compiled VBA itself, so this part is manual).
+    IMPORTANT: if you already pasted an earlier version of this macro
+    (from before the column reorder), you need to replace it with the
+    version below — the column positions it reads changed.
       a. Run the script once normally so a plain cuckoo_export.xlsx
          exists with the columns/formulas already in it.
       b. Open that file in Excel. Press Alt+F11 to open the VBA editor.
@@ -1214,15 +1636,15 @@ def write_output(records, ccs_rows=None):
          this sheet (e.g. "Sheet1 (Cuckoo Export)") — NOT "Insert >
          Module". This must be the sheet's own code-behind so the
          double-click event actually fires.
-      d. Paste in:
+      d. Paste in (replacing any earlier version):
 
            Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
                Dim r As Long, num As String, msg As String, url As String
-               If Target.Column <> 9 Then Exit Sub   ' column I = WhatsApp Link
+               If Target.Column <> 7 Then Exit Sub   ' column G = WhatsApp Link
                r = Target.Row
                If r < 2 Then Exit Sub
-               num = Trim(Cells(r, "J").Value)       ' hidden helper column
-               msg = Cells(r, "H").Value              ' WhatsApp Message
+               num = Trim(Cells(r, "K").Value)       ' hidden helper column
+               msg = Cells(r, "J").Value              ' WhatsApp Message
                If num = "" Or msg = "" Then Exit Sub
                ' web.whatsapp.com (not wa.me) on purpose — wa.me links often
                ' get intercepted by WhatsApp Desktop if it's installed, and
@@ -1241,7 +1663,7 @@ def write_output(records, ccs_rows=None):
          runs from.
       f. From then on, every run of this script detects that file and
          writes into it automatically — this setup never needs
-         repeating.
+         repeating (unless the columns change again).
     """
     ccs_rows = ccs_rows or []
 
@@ -1250,6 +1672,7 @@ def write_output(records, ccs_rows=None):
         return OUTPUT_FILE
 
     records = sorted(records, key=lambda r: r.get("sales_no", ""))
+    filters_by_sales_no = _build_filters_lookup(ccs_rows)
 
     if os.path.exists(TEMPLATE_FILE):
         try:
@@ -1259,8 +1682,8 @@ def write_output(records, ccs_rows=None):
             # but leave row 1 (headers) and the macro itself untouched.
             if ws.max_row > 1:
                 ws.delete_rows(2, ws.max_row - 1)
-            _populate_sheet(ws, records)
-            _populate_ccs_notes_sheet(wb, ccs_rows)
+            _populate_sheet(ws, records, filters_by_sales_no)
+            build_route_plan_sheet(wb, records)
             wb.save(OUTPUT_FILE_XLSM)
             return OUTPUT_FILE_XLSM
         except Exception as e:
@@ -1270,8 +1693,8 @@ def write_output(records, ccs_rows=None):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Cuckoo Export"
-    _populate_sheet(ws, records)
-    _populate_ccs_notes_sheet(wb, ccs_rows)
+    _populate_sheet(ws, records, filters_by_sales_no)
+    build_route_plan_sheet(wb, records)
     wb.save(OUTPUT_FILE)
     return OUTPUT_FILE
 
