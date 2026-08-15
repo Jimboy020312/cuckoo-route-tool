@@ -86,9 +86,9 @@ APP_PACKAGE = "cuckoo.doctress"
 # confirmed: the list screen
 APP_ACTIVITY = "cuckoo.doctress.naturalcareservicelist"
 
-LIST_LIMIT = 4   # was 3 for testing — now processes the whole list
+LIST_LIMIT = None   # was 3 for testing — now processes the whole list
 # set True again only if something breaks and you need to see raw element data
-DEBUG = True
+DEBUG = False
 
 # --- List screen (confirmed from XML) ---
 LABEL_FIELD_MAP = {
@@ -668,8 +668,7 @@ def _is_valid_ccs_product_name(product):
 def get_ccs_note_cards(driver):
     """Reads every currently-visible card on the CCS Note screen,
     keeping only ones that pass the validity checks above."""
-    wait_for(driver, (AppiumBy.XPATH,
-             '//android.widget.TextView[@text="CCS Note"]'))
+    wait_for(driver, (AppiumBy.XPATH, '//android.widget.TextView[@text="CCS Note"]'))
 
     card_elements = driver.find_elements(
         AppiumBy.XPATH,
@@ -681,8 +680,7 @@ def get_ccs_note_cards(driver):
         parsed = parse_bounds(card_el.get_attribute("bounds"))
         if not parsed:
             continue
-        text_elements = card_el.find_elements(
-            AppiumBy.CLASS_NAME, "android.widget.TextView")
+        text_elements = card_el.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
         texts = [read_text_safe(t) for t in text_elements]
         texts = [t for t in texts if t]  # drop empty separator TextViews
 
@@ -738,8 +736,7 @@ def get_all_ccs_note_cards(driver):
 
         stagnant_rounds = 0 if new_this_round > 0 else stagnant_rounds + 1
 
-        target_percent = compute_scroll_percent(
-            driver, cards[-1]["card_top_y"])
+        target_percent = compute_scroll_percent(driver, cards[-1]["card_top_y"])
         scroll_down(driver, percent=target_percent)
         scroll_count += 1
 
@@ -1092,7 +1089,7 @@ def _populate_sheet(ws, records, filters_by_sales_no):
     # address, filters, message) reads better left-aligned but still
     # vertically centered — every cell in the sheet gets vertical
     # centering regardless, only horizontal centering is selective.
-    CENTERED_COLUMNS = {1, 2, 4, 7, 8, 9}  # A, B, D, G, H, I
+    CENTERED_COLUMNS = {1, 2, 4, 7, 8, 9, 12}  # A, B, D, G, H, I, L
     WRAPPED_COLUMNS = {5, 10, 11}  # E (address), J (Filters), K (Message)
 
     for col_idx, header in enumerate(ALL_COLUMNS, start=1):
@@ -1168,16 +1165,14 @@ def _populate_sheet(ws, records, filters_by_sales_no):
 
         # H: WhatsApp Link (formula)
         h_cell = set_cell(row_idx, 8, wa_link_formula(row_idx, phone_digits))
-        h_cell.font = Font(name=FONT, size=10,
-                           color="1155CC", underline="single")
+        h_cell.font = Font(name=FONT, size=10, color="1155CC", underline="single")
 
         # I: sales_info_product
         set_cell(row_idx, 9, record.get("sales_info_product", ""))
 
         # J: Filters — combined text from CCS Note data, looked up by
         # sales_no; blank if this customer had no CCS Note data captured.
-        raw_filters_text = filters_by_sales_no.get(
-            record.get("sales_no", ""), "")
+        raw_filters_text = filters_by_sales_no.get(record.get("sales_no", ""), "")
         set_cell(row_idx, 10, _number_filters_text(raw_filters_text))
 
         # K: WhatsApp Message (formula)
@@ -1207,8 +1202,7 @@ def _build_filters_lookup(ccs_rows):
     """
     by_customer = {}
     for r in ccs_rows:
-        by_customer.setdefault(r["sales_no"], []).append(
-            (r["product"], r["last_change"]))
+        by_customer.setdefault(r["sales_no"], []).append((r["product"], r["last_change"]))
 
     lookup = {}
     for sales_no, filters in by_customer.items():
@@ -1218,6 +1212,7 @@ def _build_filters_lookup(ccs_rows):
             for product, last_change in filters_sorted
         )
     return lookup
+
 
 
 def clean_text(value):
@@ -1350,8 +1345,7 @@ def write_output(records, ccs_rows=None, filters_override=None):
     existing_areas = _load_existing_areas()
     for r in records:
         r["area"] = existing_areas.get(r.get("sales_no", ""), "")
-    filters_by_sales_no = filters_override if filters_override is not None else _build_filters_lookup(
-        ccs_rows)
+    filters_by_sales_no = filters_override if filters_override is not None else _build_filters_lookup(ccs_rows)
 
     if os.path.exists(TEMPLATE_FILE):
         try:
