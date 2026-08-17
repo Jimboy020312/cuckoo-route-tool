@@ -179,6 +179,131 @@ SCROLL_REGION_HEIGHT_FRACTION = 0.48
 
 
 # ============================================================
+# Area auto-fill (free, offline — postcode lookup + keyword matching)
+# ============================================================
+#
+# This is a SEPARATE, self-contained block from the scraping/scrolling
+# code above and below it — it doesn't touch, call, or depend on any
+# of that. It only produces suggested values for the Area 1-4 columns,
+# which write_output() then applies with one rule: NEVER overwrite a
+# cell that already has something in it (typed by hand OR auto-filled
+# on an earlier run). Only a cell that's still genuinely blank gets a
+# new auto-filled value. Tested against a real export and a batch of
+# deliberately messy addresses before being built in here. Known
+# limitation, accepted on purpose: this will leave plenty of cells
+# blank for you to fill in by hand, especially Area 3/Area 4 on
+# addresses with no commas — that's the safe trade-off on purpose,
+# not a bug.
+#
+# POSTCODE_LOOKUP_FILE is a free, offline dataset (Malaysia postcodes
+# -> state/city, from a public GitHub repo, saved locally as
+# postcodes_my.json next to this script) — no internet call at
+# runtime, no API key, no cost. If that file is ever missing, Area 1/
+# Area 2 just won't auto-fill (everything else still works normally).
+
+POSTCODE_LOOKUP_FILE = "postcodes_my.json"
+
+# Locality-type words that can appear BEFORE the name they describe
+# (the usual Malay convention, e.g. "Taman Wangsa Melawati").
+LOCALITY_KEYWORDS = [
+    "Taman", "Kampung", "Kg", "Bandar", "Presint", "Precint",
+    "Seksyen", "Desa", "Pangsapuri", "Kondominium", "Residensi",
+]
+# Road-type words — same "keyword before the name" pattern.
+STREET_KEYWORDS = ["Jalan", "Jln", "Lorong", "Persiaran", "Lebuh", "Lebuhraya"]
+
+# A match this long is almost certainly two different things run
+# together (e.g. a street name merged with the next town's name because
+# there was no comma to stop at) — confirmed by testing. Past this
+# length, the match is treated as unreliable and dropped rather than
+# risking a wrong value sitting in the sheet looking legit.
+_MAX_CONFIDENT_MATCH_CHARS = 45
+
+
+def _load_postcode_lookup(path=POSTCODE_LOOKUP_FILE):
+    """Loads the free Malaysia postcode -> (state, city) dataset. Returns
+    {} (and prints a one-time warning) if the file isn't there — Area 1/
+    Area 2 simply won't auto-fill in that case, nothing else breaks."""
+    if not os.path.exists(path):
+        print(f"  !! {path} not found next to the script — Area 1 (State) "
+              f"and Area 2 (District / City) won't auto-fill this run. "
+              f"Everything else still works normally.")
+        return {}
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        lookup = {}
+        for state in data.get("state", []):
+            for city in state.get("city", []):
+                for pc in city.get("postcode", []):
+                    lookup[pc] = (state["name"], city["name"])
+        return lookup
+    except Exception as e:
+        print(f"  !! Could not read {path} ({e}) — Area 1/Area 2 won't "
+              f"auto-fill this run.")
+        return {}
+
+
+_POSTCODE_LOOKUP = _load_postcode_lookup()
+
+_LOCALITY_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in LOCALITY_KEYWORDS) + r")\.?\s+"
+    r"[A-Za-z0-9'\-\s]*?(?=,|\d{5}|$)",
+    re.IGNORECASE,
+)
+_STREET_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in STREET_KEYWORDS) + r")\.?\s+"
+    r"[A-Za-z0-9'\-/\s]+?(?=,|\d{5}|$)",
+    re.IGNORECASE,
+)
+
+
+def detect_areas(address):
+    """
+    Takes one raw address string and returns whatever it can confidently
+    work out, as {"area1": ..., "area2": ..., "area3": ..., "area4": ...}.
+    Any level it's not confident about is left as "" — by design, not
+    left for this function to guess at.
+
+      area1 = State       )  both from the postcode found in the address,
+      area2 = District/City) looked up in the free postcode dataset
+      area3 = Locality    -  from a keyword match (Taman/Kampung/Presint/...)
+      area4 = Street      -  from a keyword match (Jalan/Lorong/...)
+
+    Area 3/Area 4 are only kept if the match is short enough to be
+    trustworthy (see _MAX_CONFIDENT_MATCH_CHARS) — a long match usually
+    means it accidentally swallowed extra, unrelated text because the
+    address had no comma to stop it cleanly.
+    """
+    result = {"area1": "", "area2": "", "area3": "", "area4": ""}
+    if not address:
+        return result
+
+    postcode_match = re.search(r"\b(\d{5})\b", address)
+    if postcode_match:
+        postcode = postcode_match.group(1)
+        if postcode in _POSTCODE_LOOKUP:
+            state, city = _POSTCODE_LOOKUP[postcode]
+            result["area1"] = state
+            result["area2"] = city
+
+    locality_match = _LOCALITY_PATTERN.search(address)
+    if locality_match:
+        text = locality_match.group(0).strip().rstrip(",")
+        if len(text) <= _MAX_CONFIDENT_MATCH_CHARS:
+            result["area3"] = text
+
+    street_match = _STREET_PATTERN.search(address)
+    if street_match:
+        text = street_match.group(0).strip().rstrip(",")
+        if len(text) <= _MAX_CONFIDENT_MATCH_CHARS:
+            result["area4"] = text
+
+    return result
+
+
+# ============================================================
 # Low-level helpers
 # ============================================================
 
@@ -963,19 +1088,36 @@ def run():
 
 # ============================================================
 # Export column order:
-#   A=sales_no, B=appt_date, C=install_contact_person,
-#   D=install_mobile1, E=install_address, F=Area (purely manual — you
-#   fill this in yourself, see _load_existing_areas), G=proposed_date
-#   (typed by hand), H=WhatsApp Link, I=sales_info_product, J=Filters
-#   (from CCS Note data), K=WhatsApp Message, L=wa_number (hidden
-#   helper).
+#   A=sales_no, B=appt_date, C=install_contact_person, D=install_mobile1,
+#   E=install_address, F-I=Area 1-4 (auto-filled when confident, see the
+#   "Area auto-fill" block above — you fill in the rest by hand, see
+#   _load_existing_area_values), J=proposed_date (typed by hand),
+#   K=WhatsApp Link, L=sales_info_product, M=Filters (from CCS Note
+#   data), N=WhatsApp Message, O=wa_number (hidden helper).
+#
+# Column letters are looked up BY NAME (see _col_letter below) rather
+# than hardcoded, precisely because this project already got bitten
+# once by a hardcoded-column-position bug after a reorder — this way
+# adding/moving a column later can't silently break a formula again.
 # ============================================================
 
 ALL_COLUMNS = [
-    "sales_no", "appt_date", "install_contact_person", "install_mobile1",
-    "install_address", "Area", "proposed_date", "WhatsApp Link",
-    "sales_info_product", "Filters", "WhatsApp Message", "wa_number",
+    "Sales No.", "Appointment Date", "Installation / Service Contact Person",
+    "Mobile No. 1", "Installation / Service Address",
+    "Area 1 (State)", "Area 2 (District / City)", "Area 3 (Locality)", "Area 4 (Street)",
+    "Proposed Date", "WhatsApp Chat Link", "Product", "Filter(s)",
+    "WhatsApp Chat Message", "WhatsApp Number",
 ]
+
+_COLUMN_INDEX = {name: idx for idx, name in enumerate(ALL_COLUMNS, start=1)}
+
+
+def _col_letter(column_name):
+    """Excel column letter for a column, looked up by its header name —
+    e.g. _col_letter("Proposed Date") -> "J". Keeps every formula below
+    immune to column reordering."""
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(_COLUMN_INDEX[column_name])
 
 
 def clean_phone_for_wa(raw):
@@ -1001,8 +1143,7 @@ def message_formula(row):
     Excel formula for one row's WhatsApp Message cell, matching the
     copywriting/formatting shown in the reference screenshot. Single
     asterisks are WhatsApp's own bold syntax, not markdown. Column
-    letters below map to the export column order above: A=sales_no,
-    E=install_address, G=proposed_date, I=sales_info_product.
+    letters are looked up by name (see _col_letter), not hardcoded.
 
     Note: if you copy this CELL (Ctrl+C, not double-click) and paste
     into something like Notepad, you'll see the whole value wrapped in
@@ -1011,19 +1152,33 @@ def message_formula(row):
     not part of the cell's actual value or this formula, and it doesn't
     matter once you're using the WhatsApp Link column instead of
     copying this text by hand.
+
+    The *Alamat:* line uses SUBSTITUTE to turn the address cell's line
+    breaks back into spaces before it goes into the message — the
+    address cell itself is formatted with Alt+Enter-style line breaks
+    for readability in the sheet (see _format_address_for_cell), but
+    since those breaks were inserted right after commas (or, for the
+    postcode, right where a plain space already was), swapping each
+    line break back to a single space reconstructs the exact original
+    single-line address text for the customer-facing message.
     """
+    sales_no_col = _col_letter("Sales No.")
+    address_col = _col_letter("Installation / Service Address")
+    date_col = _col_letter("Proposed Date")
+    product_col = _col_letter("Product")
+
     tarikh_part = (
-        f'IFERROR(TEXT(G{row},"DD/MM/YYYY") & " (" & '
-        f'CHOOSE(WEEKDAY(G{row},2),"Isnin","Selasa","Rabu","Khamis","Jumaat","Sabtu","Ahad") & ")", G{row})'
+        f'IFERROR(TEXT({date_col}{row},"DD/MM/YYYY") & " (" & '
+        f'CHOOSE(WEEKDAY({date_col}{row},2),"Isnin","Selasa","Rabu","Khamis","Jumaat","Sabtu","Ahad") & ")", {date_col}{row})'
     )
     return (
-        f'=IF(G{row}="","","Selamat sejahtera Tuan/Puan," & CHAR(10) & CHAR(10) & '
+        f'=IF({date_col}{row}="","","Selamat sejahtera Tuan/Puan," & CHAR(10) & CHAR(10) & '
         f'"Saya *Hanis*, CUCKOO+ Service Specialist (NDS35095). Saya memohon maaf jika saya menghubungi anda pada waktu yang tidak sesuai." & CHAR(10) & CHAR(10) & '
         f'"Saya ingin mengesahkan jika saya boleh membuat lawatan servis seperti di bawah." & CHAR(10) & CHAR(10) & '
         f'"*Tarikh:* " & {tarikh_part} & CHAR(10) & '
-        f'"*Alamat:* " & E{row} & CHAR(10) & '
-        f'"*Produk:* " & I{row} & CHAR(10) & '
-        f'"*Nombor Pesanan:* " & A{row} & CHAR(10) & CHAR(10) & '
+        f'"*Alamat:* " & SUBSTITUTE({address_col}{row},CHAR(10)," ") & CHAR(10) & '
+        f'"*Produk:* " & {product_col}{row} & CHAR(10) & '
+        f'"*Nombor Pesanan:* " & {sales_no_col}{row} & CHAR(10) & CHAR(10) & '
         f'"Terima kasih, sokongan dan kerjasama Tuan/Puan amat saya hargai.")'
     )
 
@@ -1042,14 +1197,15 @@ def wa_link_formula(row, phone_digits):
 
     What this DOES do: opens the right WhatsApp chat directly (a plain
     "https://wa.me/<number>" link, comfortably under 255 chars), so you
-    only need to copy the WhatsApp Message cell (column K) and paste it
-    in — no manual number lookup or searching for the contact. Column
-    letters map to the export column order above: G=proposed_date.
+    only need to copy the WhatsApp Message cell and paste it in — no
+    manual number lookup or searching for the contact. Column letter is
+    looked up by name (see _col_letter), not hardcoded.
     """
+    date_col = _col_letter("Proposed Date")
     if not phone_digits:
         return '="No phone number found"'
     return (
-        f'=IF(G{row}="","",HYPERLINK('
+        f'=IF({date_col}{row}="","",HYPERLINK('
         f'"https://wa.me/{phone_digits}",'
         f'"Open WhatsApp Chat"))'
     )
@@ -1074,6 +1230,47 @@ def _number_filters_text(text):
     return "\n".join(f"{i}. {line}" for i, line in enumerate(cleaned, start=1))
 
 
+def _format_address_for_cell(address):
+    """
+    Breaks a long address across multiple lines for easier reading in
+    the sheet — the same effect as pressing Alt+Enter at each comma —
+    WITHOUT removing anything: every comma stays exactly where it was,
+    a line break is just added right after it.
+
+    Also breaks right before the postcode, if one's found — using the
+    exact same postcode detection the Area auto-fill above already
+    relies on — since that's usually the one place a long address has
+    no comma at all to break on naturally (e.g. "...PRESINT 11
+    PUTRAJAYA 62300 WP PUTRAJAYA" runs on with no punctuation).
+
+    Needs wrap_text on for the cell to actually show as multiple lines
+    (already true for the address column via WRAPPED_COLUMNS below).
+
+    This is applied ONLY here, at display time — detect_areas() (in the
+    "Area auto-fill" block near the top of this file) still runs on the
+    original, unbroken address text before this ever happens, so none
+    of this affects Area detection.
+
+    The WhatsApp Chat Message column reconstructs the original,
+    single-line address from this (see message_formula's use of
+    SUBSTITUTE) rather than showing these line breaks in the actual
+    message text sent to the customer.
+    """
+    if not address:
+        return address
+    text = address.strip()
+    # Break right after every comma — comma itself is kept, untouched.
+    text = re.sub(r",\s*", ",\n", text)
+    # Also break right before the postcode, if it isn't already at the
+    # start of a line (e.g. wasn't already right after a comma).
+    postcode_match = re.search(r"\b\d{5}\b", text)
+    if postcode_match:
+        start = postcode_match.start()
+        if start > 0 and text[start - 1] != "\n":
+            text = text[:start].rstrip() + "\n" + text[start:]
+    return text
+
+
 def _populate_sheet(ws, records, filters_by_sales_no):
     """
     Fills in headers + rows on an already-created worksheet (either a
@@ -1089,8 +1286,16 @@ def _populate_sheet(ws, records, filters_by_sales_no):
     # address, filters, message) reads better left-aligned but still
     # vertically centered — every cell in the sheet gets vertical
     # centering regardless, only horizontal centering is selective.
-    CENTERED_COLUMNS = {1, 2, 4, 7, 8, 9, 12}  # A, B, D, G, H, I, L
-    WRAPPED_COLUMNS = {5, 10, 11}  # E (address), J (Filters), K (Message)
+    CENTERED_COLUMNS = {
+        _COLUMN_INDEX["Sales No."], _COLUMN_INDEX["Appointment Date"],
+        _COLUMN_INDEX["Mobile No. 1"], _COLUMN_INDEX["Proposed Date"],
+        _COLUMN_INDEX["WhatsApp Chat Link"], _COLUMN_INDEX["Product"],
+        _COLUMN_INDEX["WhatsApp Number"],
+    }
+    WRAPPED_COLUMNS = {
+        _COLUMN_INDEX["Installation / Service Address"],
+        _COLUMN_INDEX["Filter(s)"], _COLUMN_INDEX["WhatsApp Chat Message"],
+    }
 
     for col_idx, header in enumerate(ALL_COLUMNS, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
@@ -1098,33 +1303,41 @@ def _populate_sheet(ws, records, filters_by_sales_no):
         cell.fill = header_fill
         cell.alignment = Alignment(
             wrap_text=True, vertical="center", horizontal="center")
-    ws["F1"].comment = Comment(
-        "Purely manual — type whatever keyword/area name you recognize "
-        "here. Blank for a new customer; once you type something, every "
-        "future run keeps it exactly as typed (never auto-filled or "
-        "overwritten). Use Excel's filter on this column to pick which "
-        "area to tackle.",
-        "cuckoo_scraper.py"
+
+    area_comment_text = (
+        "Auto-filled ONLY when the script is confident (free, offline — "
+        "postcode lookup + keyword matching, no AI, no paid API). Left "
+        "blank whenever it isn't sure, rather than risk a wrong guess. "
+        "Fill in the rest yourself, or add more detail to what's already "
+        "there. Once a cell has something in it — auto-filled OR typed "
+        "by hand — every future run leaves it exactly as-is, never "
+        "overwrites it. Use Excel's filter on these columns to drill "
+        "down: Area 1 first, then Area 2, Area 3, Area 4 as needed."
     )
-    ws["G1"].comment = Comment(
+    ws[f"{_col_letter('Area 1 (State)')}1"].comment = Comment(area_comment_text, "cuckoo_scraper.py")
+    ws[f"{_col_letter('Area 2 (District / City)')}1"].comment = Comment(area_comment_text, "cuckoo_scraper.py")
+    ws[f"{_col_letter('Area 3 (Locality)')}1"].comment = Comment(area_comment_text, "cuckoo_scraper.py")
+    ws[f"{_col_letter('Area 4 (Street)')}1"].comment = Comment(area_comment_text, "cuckoo_scraper.py")
+
+    ws[f"{_col_letter('Proposed Date')}1"].comment = Comment(
         "Type a date here (e.g. 08/08/2026 or 14 August 2026 both work) —\n"
         "it displays as \"14 August 2026\" once entered.\n"
         "The WhatsApp Message and WhatsApp Link columns fill themselves in automatically.",
         "cuckoo_scraper.py"
     )
-    ws["H1"].comment = Comment(
+    ws[f"{_col_letter('WhatsApp Chat Link')}1"].comment = Comment(
         "Click to open the right WhatsApp chat directly, then copy the\n"
-        "message from column K and paste it in. (Excel's HYPERLINK function\n"
-        "can't carry a pre-filled message this long — it caps links at 255\n"
-        "characters — so this gets you to the chat, but the message still\n"
-        "needs one paste.)\n\n"
+        "WhatsApp Chat Message column and paste it in. (Excel's HYPERLINK\n"
+        "function can't carry a pre-filled message this long — it caps\n"
+        "links at 255 characters — so this gets you to the chat, but the\n"
+        "message still needs one paste.)\n\n"
         "If this file has the WhatsApp macro installed (see write_output()'s\n"
         "docstring in cuckoo_scraper.py), double-click instead of single-\n"
         "clicking — that opens the chat with the message already filled in,\n"
         "no paste needed.",
         "cuckoo_scraper.py"
     )
-    ws["L1"].comment = Comment(
+    ws[f"{_col_letter('WhatsApp Number')}1"].comment = Comment(
         "Internal use only — the macro reads this to build the full "
         "pre-filled WhatsApp link. Don't edit or delete this column.",
         "cuckoo_scraper.py"
@@ -1145,50 +1358,68 @@ def _populate_sheet(ws, records, filters_by_sales_no):
         return cell
 
     for row_idx, record in enumerate(records, start=2):
-        # A-E: plain scraped fields, in the specified order.
+        # A-E: plain scraped fields, in the specified order. Address gets
+        # one extra step (see _format_address_for_cell below) — everything
+        # else is written as-is.
         for col_idx, field in enumerate(
             ["sales_no", "appt_date", "install_contact_person",
              "install_mobile1", "install_address"], start=1
         ):
-            set_cell(row_idx, col_idx, record.get(field, ""))
+            value = record.get(field, "")
+            if field == "install_address":
+                value = _format_address_for_cell(value)
+            set_cell(row_idx, col_idx, value)
 
-        # F: Area — purely manual (see _load_existing_areas). Blank for
-        # a new customer; carried over as-is for an existing one.
-        set_cell(row_idx, 6, record.get("area", ""))
+        # F-I: Area 1-4 — auto-filled when confident, otherwise manual
+        # (see _load_existing_area_values / detect_areas). Whatever's
+        # already in `record` here (existing value OR fresh auto-fill)
+        # was already decided before write_output() got this far.
+        set_cell(row_idx, _COLUMN_INDEX["Area 1 (State)"], record.get("area1", ""))
+        set_cell(row_idx, _COLUMN_INDEX["Area 2 (District / City)"], record.get("area2", ""))
+        set_cell(row_idx, _COLUMN_INDEX["Area 3 (Locality)"], record.get("area3", ""))
+        set_cell(row_idx, _COLUMN_INDEX["Area 4 (Street)"], record.get("area4", ""))
 
-        # G: proposed_date — typed by hand, no special fill, displayed
+        # J: proposed_date — typed by hand, no special fill, displayed
         # as "14 August 2026" regardless of how it was typed in.
-        g_cell = set_cell(row_idx, 7, record.get("proposed_date"))
-        g_cell.number_format = "d mmmm yyyy"
+        date_cell = set_cell(row_idx, _COLUMN_INDEX["Proposed Date"], record.get("proposed_date"))
+        date_cell.number_format = "d mmmm yyyy"
 
         phone_digits = clean_phone_for_wa(record.get("install_mobile1", ""))
 
-        # H: WhatsApp Link (formula)
-        h_cell = set_cell(row_idx, 8, wa_link_formula(row_idx, phone_digits))
-        h_cell.font = Font(name=FONT, size=10, color="1155CC", underline="single")
+        # K: WhatsApp Chat Link (formula)
+        link_cell = set_cell(row_idx, _COLUMN_INDEX["WhatsApp Chat Link"],
+                              wa_link_formula(row_idx, phone_digits))
+        link_cell.font = Font(name=FONT, size=10, color="1155CC", underline="single")
 
-        # I: sales_info_product
-        set_cell(row_idx, 9, record.get("sales_info_product", ""))
+        # L: Product
+        set_cell(row_idx, _COLUMN_INDEX["Product"], record.get("sales_info_product", ""))
 
-        # J: Filters — combined text from CCS Note data, looked up by
+        # M: Filter(s) — combined text from CCS Note data, looked up by
         # sales_no; blank if this customer had no CCS Note data captured.
         raw_filters_text = filters_by_sales_no.get(record.get("sales_no", ""), "")
-        set_cell(row_idx, 10, _number_filters_text(raw_filters_text))
+        set_cell(row_idx, _COLUMN_INDEX["Filter(s)"], _number_filters_text(raw_filters_text))
 
-        # K: WhatsApp Message (formula)
-        set_cell(row_idx, 11, message_formula(row_idx))
+        # N: WhatsApp Chat Message (formula)
+        set_cell(row_idx, _COLUMN_INDEX["WhatsApp Chat Message"], message_formula(row_idx))
 
-        # L: wa_number — hidden helper column, the macro (if installed)
+        # O: wa_number — hidden helper column, the macro (if installed)
         # reads this directly instead of re-deriving the phone number.
-        set_cell(row_idx, 12, phone_digits)
+        set_cell(row_idx, _COLUMN_INDEX["WhatsApp Number"], phone_digits)
 
-    widths = {"A": 14, "B": 12, "C": 26, "D": 16, "E": 40, "F": 20,
-              "G": 14, "H": 18, "I": 16, "J": 40, "K": 60, "L": 12}
-    for col, w in widths.items():
-        ws.column_dimensions[col].width = w
-    ws.column_dimensions["L"].hidden = True
+    widths = {
+        "Sales No.": 14, "Appointment Date": 12, "Installation / Service Contact Person": 26,
+        "Mobile No. 1": 16, "Installation / Service Address": 40,
+        "Area 1 (State)": 16, "Area 2 (District / City)": 20,
+        "Area 3 (Locality)": 22, "Area 4 (Street)": 22,
+        "Proposed Date": 14, "WhatsApp Chat Link": 18, "Product": 16,
+        "Filter(s)": 40, "WhatsApp Chat Message": 60, "WhatsApp Number": 12,
+    }
+    for name, w in widths.items():
+        ws.column_dimensions[_col_letter(name)].width = w
+    ws.column_dimensions[_col_letter("WhatsApp Number")].hidden = True
     # Row 1 AND columns through install_mobile1 (D) stay frozen — the
-    # freeze point is the cell diagonally past both.
+    # freeze point is the cell diagonally past both. Unaffected by the
+    # Area column changes since install_address is still column E.
     ws.freeze_panes = "E2"
 
 
@@ -1230,15 +1461,26 @@ def clean_text(value):
     return re.sub(r"[ \t]+", " ", value.strip())
 
 
-def _load_existing_areas():
+_AREA_FIELD_TO_COLUMN = {
+    "area1": "Area 1 (State)",
+    "area2": "Area 2 (District / City)",
+    "area3": "Area 3 (Locality)",
+    "area4": "Area 4 (Street)",
+}
+
+
+def _load_existing_area_values():
     """
-    Reads the Area column (F) back from whichever export file already
-    exists, keyed by sales_no. Area is a purely manual field now — this
-    is what makes it survive being carried forward run after run instead
-    of getting blanked out every time the sheet is rebuilt. New
-    customers (no existing row) just aren't in this dict, so they start
-    with a blank Area cell for you to fill in yourself. Returns {} if no
-    export file exists yet.
+    Reads the Area 1-4 columns back from whichever export file already
+    exists, keyed by sales_no -> {"area1": ..., "area2": ..., ...}.
+    This is what makes anything already sitting in those columns
+    (typed by hand OR auto-filled on an earlier run) survive being
+    carried forward run after run instead of getting blanked out or
+    silently overwritten every time the sheet is rebuilt. New customers
+    (no existing row) just aren't in this dict. Returns {} if no export
+    file exists yet, or if it's an older file from before these columns
+    existed (in which case everything auto-fills fresh, same as a
+    first-ever run).
     """
     target_file = OUTPUT_FILE_XLSM if os.path.exists(OUTPUT_FILE_XLSM) else (
         OUTPUT_FILE if os.path.exists(OUTPUT_FILE) else None)
@@ -1248,21 +1490,73 @@ def _load_existing_areas():
         wb = openpyxl.load_workbook(target_file, data_only=False)
         ws = wb.active
         header_row = [c.value for c in ws[1]]
-        if "sales_no" not in header_row or "Area" not in header_row:
-            return {}  # older file, no Area column yet — nothing to carry over
-        sales_no_col = header_row.index("sales_no") + 1
-        area_col = header_row.index("Area") + 1
-        areas = {}
+        if "Sales No." not in header_row:
+            return {}
+        sales_no_col = header_row.index("Sales No.") + 1
+
+        area_cols = {}
+        for field, column_name in _AREA_FIELD_TO_COLUMN.items():
+            if column_name in header_row:
+                area_cols[field] = header_row.index(column_name) + 1
+
+        if not area_cols:
+            return {}  # older file, from before Area 1-4 existed — nothing to carry over
+
+        existing = {}
         for row_idx in range(2, ws.max_row + 1):
             sales_no = ws.cell(row=row_idx, column=sales_no_col).value
-            area = ws.cell(row=row_idx, column=area_col).value
-            if sales_no and area:
-                areas[sales_no] = area
-        return areas
+            if not sales_no:
+                continue
+            values = {}
+            for field, col_idx in area_cols.items():
+                val = ws.cell(row=row_idx, column=col_idx).value
+                if val:
+                    values[field] = val
+            if values:
+                existing[sales_no] = values
+        return existing
     except Exception as e:
         print(f"  !! Could not read existing Area values from {target_file} "
               f"({e}) — starting fresh for all customers.")
         return {}
+
+
+def build_vba_macro():
+    """
+    Builds the ready-to-paste VBA macro using the CURRENT column
+    positions (same _col_letter/_COLUMN_INDEX lookups as everything
+    else) — this is what makes the macro immune to going stale after a
+    future column reorder, which is exactly what broke it last time (it
+    was hardcoded to column H/8 for the WhatsApp Link, and drifted out
+    of sync when Area 1-4 pushed that column to K/11).
+
+    Run `python main.py --show-macro` any time you need a fresh, correct
+    copy — safer than trusting a copy/pasted version to still be right.
+    """
+    link_col_num = _COLUMN_INDEX["WhatsApp Chat Link"]
+    link_col_letter = _col_letter("WhatsApp Chat Link")
+    number_col_letter = _col_letter("WhatsApp Number")
+    message_col_letter = _col_letter("WhatsApp Chat Message")
+    return (
+        "Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)\n"
+        "    Dim r As Long, num As String, msg As String, url As String\n"
+        f"    If Target.Column <> {link_col_num} Then Exit Sub   ' column {link_col_letter} = WhatsApp Chat Link\n"
+        "    r = Target.Row\n"
+        "    If r < 2 Then Exit Sub\n"
+        f'    num = Trim(Cells(r, "{number_col_letter}").Value)       \' hidden helper column\n'
+        f'    msg = Cells(r, "{message_col_letter}").Value              \' WhatsApp Chat Message\n'
+        '    If num = "" Or msg = "" Then Exit Sub\n'
+        "    ' web.whatsapp.com (not wa.me) on purpose — wa.me links often\n"
+        "    ' get intercepted by WhatsApp Desktop if it's installed, and\n"
+        "    ' the desktop app silently drops the pre-filled text for a\n"
+        "    ' chat that already exists. Routing through web.whatsapp.com\n"
+        "    ' forces it into an actual browser tab, where the text\n"
+        "    ' reliably shows up.\n"
+        '    url = "https://web.whatsapp.com/send?phone=" & num & "&text=" & WorksheetFunction.EncodeURL(msg)\n'
+        "    ActiveWorkbook.FollowHyperlink Address:=url, NewWindow:=True\n"
+        "    Cancel = True\n"
+        "End Sub"
+    )
 
 
 def write_output(records, ccs_rows=None, filters_override=None):
@@ -1273,11 +1567,13 @@ def write_output(records, ccs_rows=None, filters_override=None):
     Link, sales_info_product, Filters, WhatsApp Message, wa_number) —
     all in ONE sheet, no separate CCS Notes/Route Plan sheet.
 
-    Area is a purely manual field: it starts blank for a new customer,
-    you type whatever you recognize (a keyword, precinct name,
-    whatever), and every future run preserves exactly what you typed —
-    it's for filtering in Excel yourself, not something this script
-    tries to guess.
+    Area 1-4 auto-fill when the script is confident (free, offline
+    postcode + keyword matching — see the "Area auto-fill" block near
+    the top of this file), and stay blank otherwise for you to fill in
+    by hand. Once any Area cell has something in it — auto-filled OR
+    typed by hand — every future run preserves it exactly as-is; it's
+    for filtering in Excel yourself, not something this script keeps
+    trying to re-guess.
 
     TWO POSSIBLE OUTPUTS, chosen automatically:
 
@@ -1297,8 +1593,13 @@ def write_output(records, ccs_rows=None, filters_override=None):
     ONE-TIME SETUP for option 1 (only needs doing once, ever —
     openpyxl can't write compiled VBA itself, so this part is manual).
     IMPORTANT: if you already pasted an earlier version of this macro
-    (from before the column reorder), you need to replace it with the
-    version below — the column positions it reads changed.
+    (from before Area 1-4 were added), it's now WRONG — it was checking
+    column H/8 for the WhatsApp Link, which shifted to K/11 when those
+    columns were inserted, so double-clicking silently did nothing.
+    Replace it with the version below (or, safer: run
+    `python main.py --show-macro` any time to print a version that's
+    guaranteed correct for the CURRENT column layout, rather than
+    trusting this docstring to stay in sync after a future change).
       a. Run the script once normally so a plain cuckoo_export.xlsx
          exists with the columns/formulas already in it.
       b. Open that file in Excel. Press Alt+F11 to open the VBA editor.
@@ -1310,11 +1611,11 @@ def write_output(records, ccs_rows=None, filters_override=None):
 
            Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
                Dim r As Long, num As String, msg As String, url As String
-               If Target.Column <> 8 Then Exit Sub   ' column H = WhatsApp Link
+               If Target.Column <> 11 Then Exit Sub   ' column K = WhatsApp Chat Link
                r = Target.Row
                If r < 2 Then Exit Sub
-               num = Trim(Cells(r, "L").Value)       ' hidden helper column
-               msg = Cells(r, "K").Value              ' WhatsApp Message
+               num = Trim(Cells(r, "O").Value)       ' hidden helper column
+               msg = Cells(r, "N").Value              ' WhatsApp Chat Message
                If num = "" Or msg = "" Then Exit Sub
                ' web.whatsapp.com (not wa.me) on purpose — wa.me links often
                ' get intercepted by WhatsApp Desktop if it's installed, and
@@ -1342,9 +1643,21 @@ def write_output(records, ccs_rows=None, filters_override=None):
         return OUTPUT_FILE
 
     records = sorted(records, key=lambda r: r.get("sales_no", ""))
-    existing_areas = _load_existing_areas()
+
+    # Area 1-4: for each customer, whatever's already in the existing
+    # file (typed by hand OR auto-filled on an earlier run) always wins
+    # and is carried over untouched. Only a field that's genuinely never
+    # been filled before gets a fresh auto-fill attempt from
+    # detect_areas() — and even then, only the specific area1/2/3/4
+    # fields it's confident about get filled; the rest stay blank for
+    # you to fill in by hand, same as before.
+    existing_area_values = _load_existing_area_values()
     for r in records:
-        r["area"] = existing_areas.get(r.get("sales_no", ""), "")
+        existing = existing_area_values.get(r.get("sales_no", ""), {})
+        auto = detect_areas(r.get("install_address", ""))
+        for field in ("area1", "area2", "area3", "area4"):
+            r[field] = existing.get(field) or auto.get(field, "")
+
     filters_by_sales_no = filters_override if filters_override is not None else _build_filters_lookup(ccs_rows)
 
     if os.path.exists(TEMPLATE_FILE):
@@ -1404,9 +1717,9 @@ def resort_existing_file():
     header_row = [c.value for c in ws[1]]
     col = {name: idx + 1 for idx, name in enumerate(header_row) if name}
 
-    required = ["sales_no", "appt_date", "install_contact_person",
-                "install_mobile1", "install_address", "proposed_date",
-                "sales_info_product", "Filters"]
+    required = ["Sales No.", "Appointment Date", "Installation / Service Contact Person",
+                "Mobile No. 1", "Installation / Service Address", "Proposed Date",
+                "Product", "Filter(s)"]
     missing = [name for name in required if name not in col]
     if missing:
         print(f"  !! {target_file}'s header row is missing {missing} — "
@@ -1418,19 +1731,19 @@ def resort_existing_file():
     records = []
     filters_by_sales_no = {}
     for row_idx in range(2, ws.max_row + 1):
-        sales_no = ws.cell(row=row_idx, column=col["sales_no"]).value
+        sales_no = ws.cell(row=row_idx, column=col["Sales No."]).value
         if not sales_no:
             continue
         records.append({
             "sales_no": sales_no,
-            "appt_date": ws.cell(row=row_idx, column=col["appt_date"]).value or "",
-            "install_contact_person": ws.cell(row=row_idx, column=col["install_contact_person"]).value or "",
-            "install_mobile1": ws.cell(row=row_idx, column=col["install_mobile1"]).value or "",
-            "install_address": ws.cell(row=row_idx, column=col["install_address"]).value or "",
-            "proposed_date": ws.cell(row=row_idx, column=col["proposed_date"]).value,
-            "sales_info_product": ws.cell(row=row_idx, column=col["sales_info_product"]).value or "",
+            "appt_date": ws.cell(row=row_idx, column=col["Appointment Date"]).value or "",
+            "install_contact_person": ws.cell(row=row_idx, column=col["Installation / Service Contact Person"]).value or "",
+            "install_mobile1": ws.cell(row=row_idx, column=col["Mobile No. 1"]).value or "",
+            "install_address": ws.cell(row=row_idx, column=col["Installation / Service Address"]).value or "",
+            "proposed_date": ws.cell(row=row_idx, column=col["Proposed Date"]).value,
+            "sales_info_product": ws.cell(row=row_idx, column=col["Product"]).value or "",
         })
-        filters_text = ws.cell(row=row_idx, column=col["Filters"]).value
+        filters_text = ws.cell(row=row_idx, column=col["Filter(s)"]).value
         if filters_text:
             filters_by_sales_no[sales_no] = filters_text
 
@@ -1443,5 +1756,7 @@ if __name__ == "__main__":
     import sys
     if "--resort" in sys.argv:
         resort_existing_file()
+    elif "--show-macro" in sys.argv:
+        print(build_vba_macro())
     else:
         run()
